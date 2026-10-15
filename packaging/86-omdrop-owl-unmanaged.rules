@@ -1,0 +1,7 @@
+# NetworkManager must not manage the interfaces omdrop-owl creates.
+#
+# The second line of defence behind 99-omdrop-owl-unmanaged.conf: udev's
+# NM_UNMANAGED doesn't depend on how NetworkManager merges its conf.d, so it
+# still holds if another file there changes what applies. Sorted after
+# NetworkManager's own 85-nm-unmanaged.rules.
+ACTION!="remove", SUBSYSTEM=="net", KERNEL=="awdl0|mon0|awdlibss0", ENV{NM_UNMANAGED}="1"

@@ -1,0 +1,54 @@
+#!/bin/sh
+# Does NetworkManager's merged config (--print-config) leave awdl0, mon0 and
+# awdlibss0 unmanaged? Exit 0 yes, 1 no (names them), 2 no NetworkManager.
+#   check-nm-unmanaged [-q] [NetworkManager options...]
+set -u
+
+quiet=
+[ "${1-}" = -q ] && { quiet=1; shift; }
+say() { [ -n "$quiet" ] || echo "$@"; }
+
+command -v NetworkManager >/dev/null 2>&1 || { say "NetworkManager isn't installed"; exit 2; }
+
+managed=$(NetworkManager --print-config "$@" 2>/dev/null | awk '
+  function add_list(s,   n, a, i) {
+    gsub(/[ \t]/, "", s)
+    n = split(s, a, /[,;]/)
+    for (i = 1; i <= n; i++) {
+      sub(/^interface-name:=?/, "", a[i])
+      list[a[i]] = 1
+    }
+  }
+  function close_section(   k) {
+    if (section ~ /^device/ && off && match_dev != "") {
+      delete list
+      add_list(match_dev)
+      for (k in list) unmanaged[k] = 1
+    }
+    section = ""; off = 0; match_dev = ""
+  }
+  /^\[/ { close_section(); section = substr($0, 2, length($0) - 2); next }
+  /^#/ { next }
+  section ~ /^device/ && /^match-device=/ { match_dev = substr($0, 14) }
+  section ~ /^device/ && /^managed=/ { v = substr($0, 9); off = (v == "0" || v == "false" || v == "no") }
+  section == "keyfile" && /^unmanaged-devices=/ {
+    delete list
+    add_list(substr($0, 19))
+    for (k in list) unmanaged[k] = 1
+  }
+  END {
+    close_section()
+    out = ""
+    if (!unmanaged["awdl0"]) out = out " awdl0"
+    if (!unmanaged["mon0"]) out = out " mon0"
+    if (!unmanaged["awdlibss0"]) out = out " awdlibss0"
+    print substr(out, 2)
+  }
+')
+
+if [ -z "$managed" ]; then
+  say "NetworkManager leaves awdl0, mon0 and awdlibss0 alone"
+  exit 0
+fi
+say "NetworkManager would manage: $managed"
+exit 1

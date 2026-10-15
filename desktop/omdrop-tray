@@ -1,0 +1,2388 @@
+#!/usr/bin/python3
+# omdrop-tray: OmDrop in the panel. Drives the omdrop CLI as its Omarchy
+# panel does (on/off/status/peers/send), reads traffic from awdl0's counters,
+# and runs setup (omdrop-installer) from the icon.
+import json
+import math
+import os
+import importlib
+import re
+import shutil
+import stat
+import sys
+import warnings
+
+import gi
+
+# On Wayland, through XWayland where there is one, so windows can sit by the icon.
+if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
+    os.environ.setdefault("GDK_BACKEND", "x11")
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+
+
+def _optional(ns, version):
+    try:
+        gi.require_version(ns, version)
+        return importlib.import_module("gi.repository." + ns)
+    except (ValueError, ImportError):
+        return None
+
+
+XApp = _optional("XApp", "1.0")
+AppIndicator = None if XApp else _optional("AyatanaAppIndicator3", "0.1")
+
+APP_ID = "io.github.kwilliam208.OmdropTray"
+HERE = os.path.dirname(os.path.realpath(__file__))
+# Beside the script in a checkout; in ~/.local/share once installed.
+ICON_DIRS = [os.path.join(HERE, "icons"),
+             os.path.expanduser("~/.local/share/omdrop-tray/icons")]
+AWDL = os.environ.get("OMDROP_AWDL_STATS", "/sys/class/net/awdl0")
+STATE_FILE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+                          "omdrop-tray", "counters.json")
+RECEIVER_UNIT = "airdrop-receiver.service"   # omdrop's UNIT
+# Its existence tells omdrop-discoverable to send at legacy 12 Mbit/s instead
+# of MCS 3 (Legacy (Troubleshooting) in the configurator); the helper reads ~/.config, not
+# $XDG_CONFIG_HOME, since it runs as root and finds the user by uid.
+LEGACY_FLAG = os.path.expanduser("~/.config/omdrop-owl/legacy-rate")
+HELPER = "/usr/lib/omdrop/omdrop-discoverable"
+MODES = {  # name, what it costs
+    "shared": ("Shared", "Wi-Fi stays on"),
+    "exclusive": ("Single radio", "Wi-Fi off while on"),
+    "active-monitor": ("Active monitor", "Wi-Fi off while on"),
+}
+
+
+def pointer():
+    _screen, x, y = Gdk.Display.get_default().get_default_seat().get_pointer().get_position()
+    return x, y
+
+
+class PanelIcon:
+    """Tray icon: XApp (Cinnamon, MATE, Xfce), else AppIndicator (KDE, GNOME, Budgie, waybar), else GTK (X11 trays)."""
+
+    def __init__(self, on_click, on_size, menu):
+        if XApp:
+            icon = XApp.StatusIcon()
+            icon.set_name("omdrop-tray")
+            icon.connect("button-release-event", lambda _i, x, y, b, *_: b == 1 and on_click(x, y))
+            icon.connect("notify::icon-size", lambda *_: on_size(icon.get_icon_size()))
+            icon.set_secondary_menu(menu)
+        elif AppIndicator:
+            icon = AppIndicator.Indicator.new("omdrop-tray", "omdrop-off-symbolic",
+                                              AppIndicator.IndicatorCategory.COMMUNICATIONS)
+            icon.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+            item = Gtk.MenuItem(label="Open OmDrop")
+            item.connect("activate", lambda *_: on_click(*pointer()))
+            menu.prepend(item)
+            menu.show_all()
+            icon.set_menu(menu)
+            icon.set_secondary_activate_target(item)
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                icon = Gtk.StatusIcon()
+            icon.connect("activate", lambda *_: on_click(*pointer()))
+            icon.connect("popup-menu", lambda _i, b, t: menu.popup(None, None, None, None, b, t))
+        self.icon = icon
+
+    def set_icon_name(self, name):
+        if XApp:
+            self.icon.set_icon_name(name)
+        elif AppIndicator:
+            if os.path.isabs(name):
+                self.icon.set_icon_theme_path(os.path.dirname(name))
+                name = os.path.splitext(os.path.basename(name))[0]
+            self.icon.set_icon_full(name, "OmDrop")
+        elif os.path.isabs(name):
+            self.icon.set_from_file(name)
+        else:
+            self.icon.set_from_icon_name(name)
+
+    def set_label(self, text):
+        if XApp:
+            self.icon.set_label(text)
+        elif AppIndicator:
+            self.icon.set_label(text, "0:00:00")
+
+    def set_tooltip_text(self, text):
+        if AppIndicator and not XApp:
+            self.icon.set_title(text)
+        else:
+            self.icon.set_tooltip_text(text)
+
+
+def setup_tool():
+    """omdrop-installer: the source's while running from it, else the installed one."""
+    for p in (os.path.join(HERE, "..", "tools", "omdrop-installer"), "/usr/lib/omdrop/omdrop-installer"):
+        if os.access(p, os.X_OK):
+            return os.path.realpath(p)
+    return None
+
+# How long to stay visible: the button's label, its tooltip, and `omdrop on`'s argument.
+DURATIONS = [
+    ("1m", "1 minute", "1m"),
+    ("5m", "5 minutes", "5m"),
+    ("20m", "20 minutes", "20m"),
+    ("1h", "1 hour", "1h"),
+    ("2h", "2 hours", "2h"),
+    ("∞", "Until you turn it off", "forever"),
+]
+DEFAULT_DURATION = "20m"
+
+
+class SpanPicker(Gtk.Box):
+    """A row of buttons, one per duration: nothing pops up, so nothing moves."""
+
+    def __init__(self):
+        super().__init__(spacing=0, homogeneous=True)
+        self.get_style_context().add_class("linked")
+        self.get_style_context().add_class("omdrop-span")
+        self.buttons, group = {}, None
+        for label, tip, arg in DURATIONS:
+            b = Gtk.RadioButton.new_with_label_from_widget(group, label)
+            b.set_mode(False)            # a button, not a radio circle
+            b.set_tooltip_text(tip)
+            group = group or b
+            self.pack_start(b, True, True, 0)
+            self.buttons[arg] = b
+        self.set_active_id(DEFAULT_DURATION)
+
+    def get_active_id(self):
+        return next(arg for arg, b in self.buttons.items() if b.get_active())
+
+    def set_active_id(self, arg):
+        if arg in self.buttons:
+            self.buttons[arg].set_active(True)
+
+# The radio gate takes 10-60 s after `omdrop on` returns; past this long,
+# a receiver nobody can see is a fault, not a start (Panel.qml's 200 s).
+SETTLE_LIMIT = 200
+POLL_SECONDS = 5
+# The popup keeps one width whatever it shows: it is anchored to the screen's
+# right edge, so a width that followed the text would slide everything sideways.
+POPUP_WIDTH = 320
+
+CSS = b"""
+window.omdrop-popup { background-color: transparent; }
+.omdrop-card {
+  background-color: rgba(28, 28, 30, 0.80);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  padding: 16px 18px;
+  margin: 6px;
+}
+.omdrop-card label { color: #f2f2f7; }
+.omdrop-title { font-weight: bold; font-size: 1.15em; }
+.omdrop-card label.omdrop-state-on { color: #64d2ff; font-weight: bold; }
+.omdrop-card label.omdrop-state-off { color: #aeaeb2; font-weight: bold; }
+.omdrop-card label.omdrop-state-loading { color: #ffd60a; font-weight: bold; }
+/* "Time left" and the clock share one style, and every number in the panel
+   uses tabular digits, so a value changing length doesn't shift its row. */
+.omdrop-clock { font-size: 1.45em; }
+.omdrop-num { font-feature-settings: "tnum"; }
+.omdrop-card label.omdrop-dim { color: rgba(242, 242, 247, 0.62); }
+.omdrop-card label.omdrop-error { color: #ff6961; }
+.omdrop-card label.omdrop-ok { color: #30d158; }
+.omdrop-card list, .omdrop-card list row { background-color: transparent; }
+.omdrop-card list row { padding: 6px 4px; border-radius: 8px; }
+.omdrop-page-title { font-weight: bold; font-size: 1.2em; }
+.omdrop-chip { border: 1px solid transparent; border-radius: 9px; }
+.omdrop-chip-here { border-color: rgba(255, 255, 255, 0.35); background-color: rgba(255, 255, 255, 0.07); }
+.omdrop-card label.omdrop-warn { color: #ffd60a; }
+.omdrop-small, .omdrop-small label { font-size: 0.85em; }
+.omdrop-span button { padding: 4px 0; min-width: 0; }
+.omdrop-span button:checked { background-image: none; background-color: #0A84FF; color: #ffffff; }
+/* The send's progress bar is the ring's blue, not the theme's accent. */
+.omdrop-card progressbar progress { background-color: #0A84FF; border-color: #0A84FF; }
+"""
+
+
+def find_cli():
+    # OMDROP_CLI points at another omdrop, such as a test stub.
+    override = os.environ.get("OMDROP_CLI")
+    if override:
+        return override
+    found = shutil.which("omdrop")
+    if found:
+        return found
+    local = os.path.expanduser("~/.local/bin/omdrop")
+    return local if os.access(local, os.X_OK) else None
+
+
+def icon_path(state):
+    """The full-colour icon, for the popup's header."""
+    for d in ICON_DIRS:
+        p = os.path.join(d, f"omdrop-{state}.svg")
+        if os.path.exists(p):
+            return p
+    return "network-wireless"  # a themed stand-in if the SVGs are missing
+
+
+def panel_icon(state):
+    """Symbolic, so the panel sizes and colours it like its own icons; a file path if not installed."""
+    name = f"omdrop-{state}-symbolic"
+    if Gtk.IconTheme.get_default().has_icon(name):
+        return name
+    return icon_path(state)
+
+
+# ------------------------------------------------------------ the send ring
+# While sending, the icon is the glyph in a ring open at the top, filling
+# clockwise in blue. Full colour (a symbolic icon can't hold blue), sized
+# against the panel's symbolic size so it sits level with its neighbours.
+
+RING_ACCENT = "#0A84FF"
+RING_GAP_DEGREES = 50
+# The symbolic glyph (desktop/icons/omdrop-on-symbolic.svg), 16 grid.
+GLYPH_PATHS = (
+    "M 4.375 14.279 A 7.25 7.25 0 1 1 11.625 14.279 L 10.875 12.980 "
+    "A 5.75 5.75 0 1 0 5.125 12.980 Z",
+    "M 5.875 11.681 A 4.25 4.25 0 1 1 10.125 11.681 L 9.375 10.382 "
+    "A 2.75 2.75 0 1 0 6.625 10.382 Z",
+    "M 8 7.6 L 10.1 15.5 L 5.9 15.5 Z",
+)
+# Against the symbolic size: a 20 px ring round an 11 px glyph beside 14 px icons.
+RING_DIAMETER = 20 / 14
+RING_STROKE = 2.3 / 14
+RING_GLYPH = 11 / 14
+
+
+def panel_icon_colour():
+    """The colour Cinnamon draws symbolic panel icons in, from its theme."""
+    try:
+        theme = Gio.Settings.new("org.cinnamon.theme").get_string("name")
+    except Exception:
+        theme = ""
+    for base in (os.path.expanduser("~/.themes"), os.path.expanduser("~/.local/share/themes"),
+                 "/usr/share/themes"):
+        css = os.path.join(base, theme, "cinnamon", "cinnamon.css")
+        try:
+            with open(css) as f:
+                m = re.search(r"\.applet-icon\s*\{[^}]*?color:\s*(#[0-9a-fA-F]{3,8})", f.read())
+        except OSError:
+            continue
+        if m:
+            return m.group(1)
+    return "#ffffff"
+
+
+def _arc(c, r, a0, a1):
+    def at(a):
+        return c + r * math.cos(math.radians(a)), c + r * math.sin(math.radians(a))
+    (x0, y0), (x1, y1) = at(a0), at(a1)
+    large = 1 if (a1 - a0) % 360 > 180 else 0
+    return f"M {x0:.3f} {y0:.3f} A {r:.3f} {r:.3f} 0 {large} 1 {x1:.3f} {y1:.3f}"
+
+
+def ring_svg(progress, canvas, symbolic, fg, accent=RING_ACCENT):
+    """The send-progress icon: progress 0..1, on a canvas px square."""
+    c = canvas / 2
+    stroke = symbolic * RING_STROKE
+    r = (symbolic * RING_DIAMETER - stroke) / 2
+    glyph = symbolic * RING_GLYPH
+    start = -90 + RING_GAP_DEGREES / 2      # the gap's right edge
+    sweep = 360 - RING_GAP_DEGREES
+    paths = "".join(f'<path d="{d}"/>' for d in GLYPH_PATHS)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{canvas}" height="{canvas}" '
+        f'viewBox="0 0 {canvas} {canvas}">',
+        f'<g fill="{fg}" transform="translate({c - glyph / 2:.3f} {c - glyph / 2:.3f}) '
+        f'scale({glyph / 16:.4f})">{paths}</g>',
+        f'<path d="{_arc(c, r, start, start + sweep)}" fill="none" stroke="{fg}" '
+        f'stroke-width="{stroke:.3f}" stroke-linecap="butt"/>',
+    ]
+    progress = max(0.0, min(1.0, progress))
+    if progress > 0:
+        parts.append(f'<path d="{_arc(c, r, start, start + max(sweep * progress, 1))}" '
+                     f'fill="none" stroke="{accent}" stroke-width="{stroke:.3f}" '
+                     f'stroke-linecap="butt"/>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+# ------------------------------------------------------------ sending files
+
+def check_file(path):
+    """None if path can be sent, else why not, in a few words."""
+    try:
+        name = os.path.basename(path)
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return "its name isn't valid UTF-8"
+    try:
+        st = os.stat(path)          # follows links: what the link points at
+    except FileNotFoundError:
+        return "it's a broken link" if os.path.lexists(path) else "it no longer exists"
+    except PermissionError:
+        return "permission denied"
+    except OSError as e:
+        return e.strerror or "can't be read"
+    if stat.S_ISDIR(st.st_mode):
+        return "it's a folder"
+    if not stat.S_ISREG(st.st_mode):
+        return "it's not a regular file"
+    try:
+        with open(path, "rb") as f:
+            f.read(1)
+    except PermissionError:
+        return "permission denied"
+    except OSError as e:
+        return e.strerror or "can't be read"
+    return None
+
+
+def check_files(paths):
+    """{path: None or why it can't be sent}, including omdrop's one-name-per-transfer rule."""
+    results = {path: check_file(path) for path in paths}
+    seen = {}
+    for path in paths:
+        name = os.path.basename(path)
+        if name in seen and not results[path]:
+            results[path] = "another file chosen has the same name"
+        seen.setdefault(name, path)
+    return results
+
+
+def peer_from_json(d):
+    """A device from `omdrop peers --json`: its address, and its name if known."""
+    mac = d.get("mac") or d.get("address")
+    if not mac:
+        return None
+    return {"address": mac, "name": d.get("name") or None, "rssi": d.get("rssi")}
+
+
+def peer_label(peer):
+    return peer.get("name") or f"Apple device ({peer['address'][-5:]})"
+
+
+def send_status(line, who):
+    """omdrop send's narration, in the popup's words (as Panel.qml words it)."""
+    line = line.strip()
+    m = re.match(r"^Preparing (.*)\.\.\.$", line)
+    if m:
+        return f"Preparing {m.group(1)}…"
+    if re.match(r"^waiting up to \d+s for .* to start listening", line):
+        return f"Waiting for {who} to wake…"
+    if re.match(r"^sending .* to \S+ at ", line):
+        return f"Waiting for {who} to accept…"
+    if line.startswith("Omdrop is off. Turning it on"):
+        return "Turning OmDrop on…"
+    return None
+
+
+def estimate_progress(sent, total):
+    """awdl0 bytes out against the files' size; held at 99% until the send succeeds."""
+    if total <= 0:
+        return 0.0
+    return max(0.0, min(0.99, sent / total))
+
+
+def send_summary(sending):
+    """(the popup's line about a finished send, whether anything failed)."""
+    files = format_files(len(sending["paths"]))
+    sent, failed = sending["sent"], sending["failed"]
+    if not failed:
+        return f"Sent {files} to {join_names(sent)}.", False
+    if not sent and len(failed) == 1:
+        who, why = failed[0]
+        return ("Sending cancelled." if why == "cancelled"
+                else why or f"Sending to {who} failed."), True
+    parts = [f"Sent {files} to {join_names(sent)}."] if sent else []
+    parts.append(f"Not sent to {join_names([w for w, _ in failed])}.")
+    return " ".join(parts), True
+
+
+def join_names(names):
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+class SendBackend:
+    """Discovery reports {"address", "name"} dicts and (status, still_looking); send reports (0..1, text), then (ok, message)."""
+
+    def start_discovery(self, on_peer, on_status):
+        raise NotImplementedError
+
+    def stop_discovery(self):
+        raise NotImplementedError
+
+    def send(self, peer, paths, on_progress, on_done):
+        raise NotImplementedError
+
+    def cancel_send(self):
+        raise NotImplementedError
+
+    def discovery_abandoned(self):
+        pass
+
+    def finish(self):
+        pass
+
+
+def read_lines(stream, on_line, on_end=None):
+    """Call on_line for each line of a subprocess pipe, on the main loop."""
+    data = Gio.DataInputStream.new(stream)
+
+    def got(s, result):
+        try:
+            line, _ = s.read_line_finish_utf8(result)
+        except GLib.Error:
+            line = None
+        if line is None:
+            if on_end:
+                on_end()
+            return
+        on_line(line)
+        s.read_line_async(GLib.PRIORITY_DEFAULT, None, got)
+
+    data.read_line_async(GLib.PRIORITY_DEFAULT, None, got)
+
+
+class OmdropBackend(SendBackend):
+    """Through the omdrop CLI: peers --json -n --stream (plain peers --json on older radios), send --to. Turns OmDrop on for discovery and back off after, if it was off."""
+
+    def __init__(self, tray):
+        self.tray = tray
+        self.discovering = False
+        self.peers_proc = None
+        self.names = True
+        self.turned_on = False
+        self.send_proc = None
+        self.progress_timer = None
+
+    def spawn(self, args, merge=False):
+        err = Gio.SubprocessFlags.STDERR_MERGE if merge else Gio.SubprocessFlags.STDERR_PIPE
+        return Gio.Subprocess.new([self.tray.cli, *args], Gio.SubprocessFlags.STDOUT_PIPE | err)
+
+    # -- discovery
+
+    def start_discovery(self, on_peer, on_status):
+        self.discovering = True
+        self.on_peer, self.on_status = on_peer, on_status
+        if not self.tray.cli:
+            on_status("The omdrop command isn't installed.", False)
+            return
+        if self.tray.status.get("receiving"):
+            self.run_peers()
+            return
+        on_status("Turning OmDrop on to look for devices…")
+
+        def turned_on(rc, out):
+            if not self.discovering:
+                return
+            if rc != 0:
+                lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+                on_status(lines[-1] if lines else "OmDrop could not be turned on.", False)
+                return
+            self.turned_on = True
+            self.tray.poll()
+            self.run_peers()
+        self.tray.cli_call(["on"], turned_on)
+
+    def run_peers(self):
+        if not self.discovering:
+            return
+        self.on_status("Looking for devices…")
+        args = ["peers", "--json", "-n", "--stream"] if self.names else ["peers", "--json"]
+        try:
+            # One pipe for both, so an error line is read before the end is.
+            proc = self.peers_proc = self.spawn(args, merge=True)
+        except GLib.Error as e:
+            self.on_status(e.message, False)
+            return
+        started = GLib.get_monotonic_time()
+        errors = []
+
+        def line(text):
+            text = text.strip()
+            if not text:
+                return
+            try:
+                found = json.loads(text)
+            except ValueError:
+                errors.append(text)
+                return
+            for d in found if isinstance(found, list) else [found]:
+                peer = peer_from_json(d) if isinstance(d, dict) else None
+                if peer and self.discovering:
+                    self.on_peer(peer)
+
+        def ended():
+            if proc is not self.peers_proc:
+                return
+            self.peers_proc = None
+            if not self.discovering:
+                return
+            quick = GLib.get_monotonic_time() - started < 5_000_000
+            if self.names and quick and any("newer" in e for e in errors):
+                self.names = False          # an older radio package: no names
+                GLib.idle_add(lambda: self.run_peers() and False)
+                return
+            # A lookup that ends at once would otherwise rerun in a tight loop.
+            GLib.timeout_add(10_000 if quick else 250, lambda: self.run_peers() and False)
+
+        read_lines(proc.get_stdout_pipe(), line, ended)
+
+    def stop_discovery(self):
+        self.discovering = False
+        if self.peers_proc:
+            self.peers_proc.send_signal(15)
+            self.peers_proc = None
+
+    def discovery_abandoned(self):
+        """Nothing was sent: put OmDrop back the way it was."""
+        self.turn_back_off()
+
+    def finish(self):
+        """The last send is over: put OmDrop back the way it was."""
+        self.turn_back_off()
+
+    def turn_back_off(self):
+        if self.turned_on:
+            self.turned_on = False
+            self.tray.cli_call(["off"], lambda rc, out: self.tray.poll())
+
+    # -- sending
+
+    def send(self, peer, paths, on_progress, on_done):
+        who = peer_label(peer)
+        total = 0
+        for p in paths:
+            try:
+                total += os.path.getsize(p)
+            except OSError:
+                pass
+        try:
+            proc = self.send_proc = self.spawn(["send", "--to", peer["address"], "--", *paths])
+        except GLib.Error as e:
+            on_done(False, e.message)
+            return
+        stats = os.path.join(AWDL, "statistics")
+        # awdl0's transmit count from here on. If OmDrop comes on during the
+        # send, awdl0 is new and counts from zero; what the old one sent carries.
+        state = {"text": f"Sending to {who}…", "last": "", "sent": 0, "offset": 0,
+                 "base": read_int(os.path.join(stats, "tx_bytes")) or 0,
+                 "ifindex": read_int(os.path.join(AWDL, "ifindex"))}
+
+        def narrate(line):
+            if line.strip():
+                state["last"] = line.strip()
+            said = send_status(line, who)
+            if said:
+                state["text"] = said
+                on_progress(estimate_progress(state["sent"], total), said)
+
+        def sample():
+            tx = read_int(os.path.join(stats, "tx_bytes"))
+            ifindex = read_int(os.path.join(AWDL, "ifindex"))
+            if tx is not None:
+                if ifindex != state["ifindex"]:
+                    state.update(offset=state["sent"], base=0, ifindex=ifindex)
+                state["sent"] = max(state["sent"], state["offset"] + tx - state["base"])
+            fraction = estimate_progress(state["sent"], total)
+            if fraction > 0.02 and not state["text"].startswith("Sending "):
+                state["text"] = f"Sending {format_files(len(paths))} to {who}"
+            on_progress(fraction, state["text"])
+            return True
+
+        self.progress_timer = GLib.timeout_add(500, sample)
+        read_lines(proc.get_stdout_pipe(), narrate)
+        read_lines(proc.get_stderr_pipe(), narrate)
+
+        def finished(p, result):
+            try:
+                p.wait_finish(result)
+            except GLib.Error:
+                pass
+            if self.progress_timer:
+                GLib.source_remove(self.progress_timer)
+                self.progress_timer = None
+            cancelled = self.send_proc is None
+            self.send_proc = None
+            ok = p.get_if_exited() and p.get_exit_status() == 0
+            if ok:
+                on_progress(1.0, f"Sent to {who}")
+            if not cancelled:
+                on_done(ok, "" if ok else (state["last"] or f"Sending to {who} failed."))
+
+        proc.wait_async(None, finished)
+
+    def cancel_send(self):
+        proc, self.send_proc = self.send_proc, None
+        if proc:
+            proc.send_signal(15)
+
+
+# The send backend the applet uses.
+BACKEND = OmdropBackend
+
+
+def floor_units(value, units, step=1000):
+    """value in the largest of units it reaches (the first at least), rounded down."""
+    unit = units[0]
+    for next_unit in units[1:]:
+        if value < step:
+            break
+        value, unit = value / step, next_unit
+    return f"{math.floor(value)} {unit}"
+
+
+def format_rate(bits_per_second):
+    return floor_units(bits_per_second / 1000, ("Kb/s", "Mb/s", "Gb/s", "Tb/s"))
+
+
+def format_size(n_bytes):
+    return floor_units(n_bytes / 1000, ("KB", "MB", "GB", "TB"))
+
+
+def format_files(n):
+    return f"{n} file" if n == 1 else f"{n} files"
+
+
+def format_clock(seconds):
+    seconds = max(0, int(seconds))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def files_in_log_line(line):
+    """How many files a receiver log line says it stored (cmd_watch's rules)."""
+    if "upload " in line and ": stored " in line:
+        rest = line.split(": stored ", 1)[1]
+        return len([f for f in rest.split(",") if f.strip()])
+    if "link stored as " in line:
+        return 1
+    return 0
+
+
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+class Counters:
+    """awdl0 bytes in and out, and files received and sent, kept until Reset. A new ifindex is a new awdl0, counting from zero."""
+
+    def __init__(self):
+        self.transferred = 0
+        self.files = 0
+        self.ifindex = None
+        self.last_total = None      # awdl0's rx + tx when last counted
+        self.prev_total = None      # and a second ago, for the rate
+        self.rate = 0.0
+        self.dirty = False
+        self.load()
+
+    def load(self):
+        try:
+            with open(STATE_FILE) as f:
+                d = json.load(f)
+            # "received" is what versions that counted only inbound saved.
+            self.transferred = int(d.get("transferred", d.get("received", 0)))
+            self.files = int(d.get("files", 0))
+            self.ifindex = d.get("ifindex")
+            last = d.get("last_total")
+            self.last_total = int(last) if last is not None else None
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def save(self):
+        if not self.dirty:
+            return
+        try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"transferred": self.transferred, "files": self.files,
+                           "ifindex": self.ifindex, "last_total": self.last_total}, f)
+            os.replace(tmp, STATE_FILE)
+            self.dirty = False
+        except OSError:
+            pass
+
+    def reset(self):
+        self.transferred = 0
+        self.files = 0
+        self.dirty = True
+        self.save()
+
+    def add_files(self, n):
+        if n:
+            self.files += n
+            self.dirty = True
+
+    def sample(self, seconds):
+        stats = os.path.join(AWDL, "statistics")
+        rx = read_int(os.path.join(stats, "rx_bytes"))
+        tx = read_int(os.path.join(stats, "tx_bytes"))
+        if rx is None or tx is None:
+            self.prev_total, self.rate = None, 0.0
+            return
+        total = rx + tx
+        ifindex = read_int(os.path.join(AWDL, "ifindex"))
+        if ifindex != self.ifindex or (self.last_total is not None and total < self.last_total):
+            # A new awdl0: all of its count is new.
+            self.ifindex, self.last_total, self.prev_total = ifindex, 0, None
+            self.dirty = True
+        elif self.last_total is None:
+            self.last_total = total     # an old count with no baseline: start here
+        if total != self.last_total:
+            self.transferred += total - self.last_total
+            self.last_total = total
+            self.dirty = True
+        if self.prev_total is not None and total >= self.prev_total and seconds > 0:
+            self.rate = (total - self.prev_total) * 8 / seconds
+        else:
+            self.rate = 0.0
+        self.prev_total = total
+
+
+def value_label(chars):
+    """A right-aligned number of fixed width, so its row stays put."""
+    label = Gtk.Label(xalign=1)
+    label.set_width_chars(chars)
+    label.get_style_context().add_class("omdrop-num")
+    return label
+
+
+class CardWindow(Gtk.Window):
+    """A borderless, translucent card with the OmDrop header: icon, title, and a
+    label on the right."""
+
+    def __init__(self, tray, title, width, hint=Gdk.WindowTypeHint.UTILITY):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL, title=title)
+        self.tray = tray
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_keep_above(True)
+        self.set_type_hint(hint)
+        self.get_style_context().add_class("omdrop-popup")
+        visual = self.get_screen().get_rgba_visual()
+        if visual is not None:
+            self.set_visual(visual)
+            self.set_app_paintable(True)
+        self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.card.get_style_context().add_class("omdrop-card")
+        self.card.set_size_request(width, -1)
+        self.add(self.card)
+        head = Gtk.Box(spacing=10)
+        self.head_icon = Gtk.Image.new_from_gicon(
+            Gio.FileIcon.new(Gio.File.new_for_path(icon_path("on"))), Gtk.IconSize.DND)
+        head.pack_start(self.head_icon, False, False, 0)
+        label = Gtk.Label(label=title, xalign=0)
+        label.get_style_context().add_class("omdrop-title")
+        head.pack_start(label, True, True, 0)
+        self.aside = Gtk.Label(xalign=1)
+        head.pack_end(self.aside, False, False, 0)
+        self.card.pack_start(head, False, False, 0)
+
+    def refit(self):
+        self.resize(1, 1)
+        self.tray.place_window(self)
+
+
+class Popup(CardWindow):
+    def __init__(self, tray):
+        super().__init__(tray, "OmDrop", POPUP_WIDTH)
+        card = self.card
+        self.state_label = self.aside
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_vhomogeneous(False)
+        card.pack_start(self.stack, False, False, 0)
+
+        # Off: how long.
+        off = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        off.pack_start(Gtk.Label(label="Turn OmDrop on for:", xalign=0), False, False, 0)
+        self.duration = SpanPicker()
+        off.pack_start(self.duration, False, False, 0)
+        self.stack.add_named(off, "off")
+
+        # On or loading: "Time left" and the clock, in one style on one row.
+        on = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        clock_row = Gtk.Box(spacing=8)
+        self.clock_title = Gtk.Label(xalign=0)
+        self.clock_title.get_style_context().add_class("omdrop-clock")
+        clock_row.pack_start(self.clock_title, False, False, 0)
+        self.clock = value_label(8)
+        self.clock.get_style_context().add_class("omdrop-clock")
+        clock_row.pack_end(self.clock, False, False, 0)
+        on.pack_start(clock_row, False, False, 0)
+        self.window_label = Gtk.Label(xalign=0)
+        self.window_label.get_style_context().add_class("omdrop-dim")
+        on.pack_start(self.window_label, False, False, 0)
+        activity_row = Gtk.Box(spacing=8)
+        activity_row.pack_start(Gtk.Label(label="Activity:", xalign=0), False, False, 0)
+        self.activity = value_label(10)
+        activity_row.pack_end(self.activity, False, False, 0)
+        on.pack_start(activity_row, False, False, 0)
+        self.stack.add_named(on, "on")
+
+        # Both: what has come in and gone out since the last Reset.
+        received_row = Gtk.Box(spacing=8)
+        received_row.pack_start(Gtk.Label(label="Data transferred:", xalign=0), False, False, 0)
+        self.received = value_label(18)
+        received_row.pack_end(self.received, False, False, 0)
+        card.pack_start(received_row, False, False, 0)
+
+        # The on/off button, with Reset and the downloads folder beside it.
+        buttons = Gtk.Box(spacing=6)
+        self.toggle = Gtk.Button()
+        self.toggle.connect("clicked", self.on_toggle)
+        buttons.pack_start(self.toggle, True, True, 0)
+        self.reset = Gtk.Button(label="Reset")
+        self.reset.set_tooltip_text("Set Data transferred and the file count back to zero")
+        self.reset.connect("clicked", lambda *_: self.tray.reset_counters())
+        buttons.pack_start(self.reset, False, False, 0)
+        self.folder = Gtk.Button.new_from_icon_name("folder-symbolic", Gtk.IconSize.BUTTON)
+        self.folder.connect("clicked", lambda *_: self.tray.open_folder())
+        buttons.pack_start(self.folder, False, False, 0)
+        card.pack_start(buttons, False, False, 2)
+
+        # Sending: its own button, and while a send runs, its progress.
+        self.send_button = Gtk.Button(label="Send Files…")
+        self.send_button.connect("clicked", lambda *_: self.tray.send_files())
+        card.pack_start(self.send_button, False, False, 0)
+        self.sending_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        sending_top = Gtk.Box(spacing=8)
+        self.sending_label = Gtk.Label(xalign=0)
+        self.sending_label.set_ellipsize(3)  # Pango.EllipsizeMode.END
+        self.sending_label.set_max_width_chars(1)   # ellipsize at the card's width, never widen it
+        sending_top.pack_start(self.sending_label, True, True, 0)
+        self.sending_cancel = Gtk.Button(label="Cancel")
+        self.sending_cancel.connect("clicked", lambda *_: self.tray.cancel_send())
+        sending_top.pack_end(self.sending_cancel, False, False, 0)
+        self.sending_box.pack_start(sending_top, False, False, 0)
+        self.sending_bar = Gtk.ProgressBar()
+        self.sending_box.pack_start(self.sending_bar, False, False, 0)
+        card.pack_start(self.sending_box, False, False, 0)
+
+        self.detail = Gtk.Label(xalign=0, wrap=True)
+        self.detail.set_max_width_chars(1)   # wrap at the card's width, never widen it
+        self.detail.get_style_context().add_class("omdrop-dim")
+        card.pack_start(self.detail, False, False, 0)
+
+        self.connect("focus-out-event", self.on_focus_out)
+        self.connect("key-press-event", self.on_key)
+        self.connect("delete-event", lambda *_: self.hide() or True)
+        card.show_all()
+        self.sending_box.hide()
+
+    def on_toggle(self, _button):
+        if self.tray.state == "off" and not self.tray.busy:
+            self.tray.turn_on(self.duration.get_active_id())
+        else:
+            self.tray.turn_off()
+
+    def on_key(self, _w, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.hide()
+        return False
+
+    def on_focus_out(self, *_):
+        GLib.timeout_add(150, self._hide_if_unfocused)
+        return False
+
+    def _hide_if_unfocused(self):
+        if not self.is_active():
+            self.hide()
+        return False
+
+    def place(self, x, y):
+        place_near(self, x, y)
+
+
+def place_near(window, x, y):
+    """Put window in the corner of the monitor's work area nearest (x, y)."""
+    display = Gdk.Display.get_default()
+    if x or y:
+        monitor = display.get_monitor_at_point(x, y)
+    else:
+        # Opened without a click (launched again from the menu): Mint's
+        # tray corner, bottom right of the primary monitor.
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+    area = monitor.get_workarea()
+    size = window.get_preferred_size()[1]
+    w, h = size.width, size.height
+    margin = 4
+    right = x >= area.x + area.width / 2 if (x or y) else True
+    bottom = y >= area.y + area.height / 2 if (x or y) else True
+    px = area.x + area.width - w - margin if right else area.x + margin
+    py = area.y + area.height - h - margin if bottom else area.y + margin
+    window.move(px, py)
+
+
+class SendWindow(CardWindow):
+    """Files, then devices. Discovery starts before the chooser opens."""
+
+    WIDTH = 380
+
+    def __init__(self, tray, paths):
+        super().__init__(tray, "Send Files", self.WIDTH, Gdk.WindowTypeHint.DIALOG)
+        card = self.card
+        self.paths = list(paths)
+        self.peers = {}               # address -> (peer, row)
+        self.step = self.aside
+        self.step.get_style_context().add_class("omdrop-dim")
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_vhomogeneous(False)
+        card.pack_start(self.stack, False, False, 0)
+
+        # Step 1: the files, checked on Next.
+        files = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.files_list = Gtk.ListBox()
+        self.files_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(60)
+        scroller.set_max_content_height(220)
+        scroller.set_propagate_natural_height(True)
+        scroller.add(self.files_list)
+        files.pack_start(scroller, False, False, 0)
+        self.files_note = Gtk.Label(xalign=0, wrap=True)
+        self.files_note.set_max_width_chars(1)
+        files.pack_start(self.files_note, False, False, 0)
+        self.stack.add_named(files, "files")
+
+        # Step 2: the devices, filling in as they answer.
+        devices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        searching = Gtk.Box(spacing=8)
+        self.spinner = Gtk.Spinner()
+        searching.pack_start(self.spinner, False, False, 0)
+        self.search_label = Gtk.Label(label="Looking for devices…", xalign=0, wrap=True)
+        self.search_label.set_max_width_chars(1)
+        self.search_label.get_style_context().add_class("omdrop-dim")
+        searching.pack_start(self.search_label, True, True, 0)
+        devices.pack_start(searching, False, False, 0)
+        # A checkbox per device: one send can go to several, one after another.
+        self.devices_list = Gtk.ListBox()
+        self.devices_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.devices_list.set_activate_on_single_click(True)
+        self.devices_list.connect("row-activated", self.on_row_activated)
+        dev_scroller = Gtk.ScrolledWindow()
+        dev_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        dev_scroller.set_min_content_height(120)
+        dev_scroller.set_max_content_height(220)
+        dev_scroller.add(self.devices_list)
+        devices.pack_start(dev_scroller, False, False, 0)
+        hint = Gtk.Label(xalign=0, wrap=True, label=(
+            "On the iPhone, set receiving to Everyone for 10 Minutes and keep it unlocked."))
+        hint.set_max_width_chars(1)
+        hint.get_style_context().add_class("omdrop-dim")
+        devices.pack_start(hint, False, False, 0)
+        self.stack.add_named(devices, "devices")
+
+        buttons = Gtk.Box(spacing=6)
+        self.back = Gtk.Button(label="Cancel")
+        self.back.connect("clicked", self.on_back)
+        buttons.pack_start(self.back, False, False, 0)
+        self.next = Gtk.Button(label="Next")
+        self.next.get_style_context().add_class("suggested-action")
+        self.next.connect("clicked", self.on_next)
+        buttons.pack_end(self.next, False, False, 0)
+        card.pack_start(buttons, False, False, 2)
+
+        self.connect("key-press-event", self.on_key)
+        self.connect("delete-event", lambda *_: self.cancel() or True)
+        card.show_all()
+        self.show_files()
+
+    # -- step 1
+
+    def show_files(self, results=None):
+        for row in self.files_list.get_children():
+            self.files_list.remove(row)
+        # Once checked, the files that can't go come first, where they're seen.
+        order = sorted(self.paths, key=lambda p: not results.get(p)) if results else self.paths
+        home = os.path.expanduser("~")
+        for path in order:
+            problem = results.get(path) if results else None
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            top = Gtk.Box(spacing=8)
+            name = Gtk.Label(label=os.path.basename(path), xalign=0)
+            name.set_ellipsize(3)   # Pango.EllipsizeMode.END
+            top.pack_start(name, True, True, 0)
+            size = Gtk.Label(xalign=1)
+            size.get_style_context().add_class("omdrop-num")
+            if os.path.isfile(path):
+                try:
+                    size.set_text(format_size(os.path.getsize(path)))
+                except OSError:
+                    pass
+            top.pack_end(size, False, False, 0)
+            row.pack_start(top, False, False, 0)
+            folder = os.path.dirname(path)
+            if folder == home or folder.startswith(home + os.sep):
+                folder = "~" + folder[len(home):]
+            where = Gtk.Label(label=folder, xalign=0)
+            where.set_ellipsize(1)  # Pango.EllipsizeMode.START
+            where.get_style_context().add_class("omdrop-dim")
+            row.pack_start(where, False, False, 0)
+            if results is not None:
+                verdict = Gtk.Label(xalign=0, label=f"✗ Can't send: {problem}" if problem else "✓ Ready")
+                verdict.get_style_context().add_class("omdrop-error" if problem else "omdrop-ok")
+                row.pack_start(verdict, False, False, 0)
+            self.files_list.add(row)
+        self.files_list.show_all()
+        total = len(self.paths)
+        self.files_note.set_text("" if results is None else
+                                 f"{sum(1 for p in self.paths if results.get(p))} of {total} can't be "
+                                 "sent. Remove them or choose again." if any(results.values()) else "")
+        self.files_note.get_style_context().add_class("omdrop-error")
+        self.files_note.set_visible(bool(self.files_note.get_text()))
+        self.stack.set_visible_child_name("files")
+        self.step.set_text(f"{format_files(total)} · step 1 of 2")
+        self.back.set_label("Cancel")
+        self.next.set_label("Next")
+        self.update_buttons()
+        self.refit()
+
+    def on_next(self, _button):
+        if self.stack.get_visible_child_name() == "devices":
+            self.on_send()
+            return
+        results = check_files(self.paths)
+        if any(results.values()):
+            failed = [p for p in self.paths if results[p]]
+            if self.next.get_label() == "Remove and Next":
+                self.paths = [p for p in self.paths if p not in failed]
+                if not self.paths:
+                    self.cancel()
+                    return
+                self.show_files()
+                return
+            self.show_files(results)
+            if len(failed) < len(self.paths):
+                self.next.set_label("Remove and Next")
+            return
+        self.show_devices()
+
+    # -- step 2
+
+    def show_devices(self):
+        self.stack.set_visible_child_name("devices")
+        self.step.set_text(f"{format_files(len(self.paths))} · step 2 of 2")
+        self.back.set_label("Back")
+        self.next.set_label("Send")
+        self.spinner.start()
+        self.update_buttons()
+        self.refit()
+
+    def add_peer(self, peer):
+        key = peer.get("address")
+        if not key:
+            return
+        if key in self.peers:
+            old, row = self.peers[key]
+            if peer.get("name") or not old.get("name"):
+                row.get_child().get_children()[0].set_text(peer_label(peer))
+                self.peers[key] = (peer, row)
+            return
+        line = Gtk.Box(spacing=10)
+        line.pack_start(Gtk.Label(label=peer_label(peer), xalign=0), True, True, 0)
+        check = Gtk.CheckButton()
+        check.connect("toggled", lambda *_: self.update_buttons())
+        line.pack_end(check, False, False, 0)
+        row = Gtk.ListBoxRow()
+        row.add(line)
+        row.show_all()
+        self.devices_list.add(row)
+        self.peers[key] = (peer, row)
+        self.search_label.set_text(
+            f"{len(self.peers)} found. Still looking…" if len(self.peers) != 1 else "1 found. Still looking…")
+        self.update_buttons()
+
+    def set_search_status(self, text, busy=True):
+        if busy and self.peers:
+            return      # the count of devices found says more
+        self.search_label.set_text(text)
+        (self.spinner.start if busy else self.spinner.stop)()
+        self.refit()
+
+    @staticmethod
+    def row_check(row):
+        return row.get_child().get_children()[-1]
+
+    def on_row_activated(self, _list, row):
+        check = self.row_check(row)
+        check.set_active(not check.get_active())
+
+    def chosen_peers(self):
+        """The ticked devices, in the order they appeared."""
+        return [peer for peer, row in self.peers.values() if self.row_check(row).get_active()]
+
+    def on_send(self):
+        peers = self.chosen_peers()
+        if not peers or self.stack.get_visible_child_name() != "devices":
+            return
+        self.tray.start_send(peers, list(self.paths))
+        self.destroy()
+
+    # -- both
+
+    def update_buttons(self):
+        if self.stack.get_visible_child_name() == "devices":
+            n = len(self.chosen_peers())
+            self.next.set_sensitive(n > 0)
+            self.next.set_label(f"Send to {n}" if n > 1 else "Send")
+        else:
+            self.next.set_sensitive(bool(self.paths))
+
+    def on_back(self, _button):
+        if self.stack.get_visible_child_name() == "devices":
+            self.spinner.stop()
+            self.show_files()
+        else:
+            self.cancel()
+
+    def on_key(self, _w, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.cancel()
+        return False
+
+    def cancel(self):
+        self.tray.end_discovery(abandoned=True)
+        self.destroy()
+
+
+def run_streaming(args, on_line, on_done, env=None):
+    """Run args with OMDROP_GUI=1 (privileged steps ask through polkit), each
+    output line to on_line, then on_done(exit status)."""
+    launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+    launcher.setenv("OMDROP_GUI", "1", True)
+    for key, value in (env or {}).items():
+        launcher.setenv(key, value, True)
+    try:
+        proc = launcher.spawnv(args)
+    except GLib.Error as e:
+        on_line(e.message)
+        on_done(1)
+        return None
+    # Done once the output has been read to its end and the process has exited.
+    state = {"left": 2, "rc": 1}
+
+    def one_more():
+        state["left"] -= 1
+        if state["left"] == 0:
+            on_done(state["rc"])
+
+    def exited(p, result):
+        p.wait_finish(result)
+        state["rc"] = p.get_exit_status() if p.get_if_exited() else 1
+        one_more()
+    read_lines(proc.get_stdout_pipe(), on_line, one_more)
+    proc.wait_async(None, exited)
+    return proc
+
+
+class SetupStep(Gtk.Box):
+    """A step: its circle (○ to do, ◔ running, ● done), title, button, and detail."""
+
+    MARKS = {"todo": "○", "busy": "◔", "ok": "●", "warn": "●", "fail": "●"}
+    COLOURS = {"ok": "omdrop-ok", "warn": "omdrop-warn", "fail": "omdrop-error"}
+
+    def __init__(self, title, button=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.state = "todo"
+        top = Gtk.Box(spacing=8)
+        self.mark = Gtk.Label(label=self.MARKS["todo"], width_chars=2)
+        top.pack_start(self.mark, False, False, 0)
+        name = Gtk.Label(label=title, xalign=0)
+        name.get_style_context().add_class("omdrop-page-title")
+        top.pack_start(name, True, True, 0)
+        self.button = None
+        if button:
+            self.button = Gtk.Button(label=button)
+            top.pack_end(self.button, False, False, 0)
+        self.pack_start(top, False, False, 0)
+        self.detail = Gtk.Label(xalign=0, wrap=True)
+        self.detail.set_max_width_chars(1)
+        self.detail.get_style_context().add_class("omdrop-dim")
+        self.pack_start(self.detail, False, False, 0)
+
+    def set(self, state, detail=None):
+        self.state = state
+        paint(self.mark, self.MARKS[state], self.COLOURS.get(state))
+        if detail is not None:
+            self.detail.set_text(detail)
+            self.detail.set_visible(bool(detail))
+
+
+def paint(label, text, colour):
+    label.set_text(text)
+    ctx = label.get_style_context()
+    for c in SetupStep.COLOURS.values():
+        ctx.remove_class(c)
+    if colour:
+        ctx.add_class(colour)
+
+
+def wrapped(text, dim=False):
+    label = Gtk.Label(label=text, xalign=0, wrap=True)
+    label.set_max_width_chars(1)
+    if dim:
+        label.get_style_context().add_class("omdrop-dim")
+    return label
+
+
+TRENCHCOAT = (
+    "One question, in a trenchcoat. OmDrop and your Wi-Fi share one card. Some cards "
+    "can do both at once (Shared). Others hand OmDrop the whole card while it's on "
+    "(Single radio), so Wi-Fi drops until you turn OmDrop off. Underneath, it's a laptop "
+    "or desktop question: plugged into Ethernet, lending OmDrop the card costs nothing; "
+    "living on Wi-Fi, you'll notice.")
+
+
+class ConfigWindow(CardWindow):
+    """Install, then configure: one window that stays put. Before an install it walks
+    the steps in order; after, any step can be revisited, and the corner holds the
+    file locations and Uninstall."""
+
+    WIDTH, PAGE_HEIGHT = 400, 300
+    NAMES = ("Check", "Install", "Detect HW", "Mode")
+
+    def __init__(self, tray):
+        self.configuring = os.access(HELPER, os.X_OK)
+        super().__init__(tray, "OmDrop Configurator" if self.configuring else "OmDrop Installer",
+                         self.WIDTH, Gdk.WindowTypeHint.DIALOG)
+        self.aside.get_style_context().add_class("omdrop-dim")
+        self.tool = setup_tool()
+        self.proc = None
+        self.recommended = None
+        self.detected = False
+        self.failed = {}          # mode: why Detect HW couldn't bring it up here
+        self.go = None
+        self.page = 0
+        self.check = SetupStep("1 · Compatibility", "Check again")
+        self.install = SetupStep("2 · Install", "Install")
+        self.detect = SetupStep("3 · Detect HW", "Run")
+        self.choose = SetupStep("4 · Mode")
+        self.steps = (self.check, self.install, self.detect, self.choose)
+
+        # The circles, one a step: where you are, and in the configurator a way there.
+        chips = Gtk.Box(spacing=4, homogeneous=True)
+        self.chips = []
+        for i, name in enumerate(self.NAMES):
+            chip = Gtk.Button()
+            chip.set_relief(Gtk.ReliefStyle.NONE)
+            chip.get_style_context().add_class("omdrop-chip")
+            box = Gtk.Box(spacing=4, halign=Gtk.Align.CENTER)
+            dot = Gtk.Label(label="○")
+            box.pack_start(dot, False, False, 0)
+            box.pack_start(Gtk.Label(label=name), False, False, 0)
+            chip.add(box)
+            chip.connect("clicked", lambda _b, i=i: self.go_to(i))
+            chips.pack_start(chip, True, True, 0)
+            self.chips.append((chip, dot))
+        self.card.pack_start(chips, False, False, 0)
+
+        intros = (
+            "Checks this computer can run OmDrop.",
+            "Installs what OmDrop needs, and keeps a ledger of every change so "
+            "Uninstall can put it all back. Asks for your password once.",
+            "Tries each way this Wi-Fi card can run OmDrop, about 20 seconds each, "
+            "and recommends the one that works best.",
+            TRENCHCOAT,
+        )
+        self.pages = Gtk.Stack()
+        self.pages.set_transition_type(Gtk.StackTransitionType.NONE)
+        self.pages.set_size_request(-1, self.PAGE_HEIGHT)
+        for i, (step, intro) in enumerate(zip(self.steps, intros)):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            step.reorder_child(step.detail, 1)
+            step.pack_start(wrapped(intro), False, False, 0)
+            step.reorder_child(step.get_children()[-1], 1)
+            page.pack_start(step, False, False, 0)
+            self.pages.add_named(scrolled(page), str(i))
+        self.ledger = wrapped("", dim=True)
+        self.ledger.get_style_context().add_class("omdrop-small")
+        self.install.pack_start(self.ledger, False, False, 4)
+        self.mode_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.choose.pack_start(self.mode_box, False, False, 0)
+        self.legacy = Gtk.CheckButton(label="Legacy (Troubleshooting)")
+        self.legacy.set_tooltip_text("Sends at the old 12 Mbit/s. Try it if sends stall on this card.")
+        self.legacy.set_active(os.path.exists(LEGACY_FLAG))
+        self.legacy.connect("toggled", lambda b: self.tray.set_legacy(b.get_active()))
+        self.choose.pack_start(self.legacy, False, False, 6)
+        self.mode_buttons = {}
+
+        undo, before = ledger_summary()
+        gone = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        gone.pack_start(wrapped("Removes Linux OmDrop Installer and puts back what it changed:"), False, False, 0)
+        gone.pack_start(wrapped("\n".join("• " + u for u in undo) or "• Nothing recorded to undo"), False, False, 0)
+        if before:
+            gone.pack_start(wrapped("Before it was installed:\n" + "\n".join(before), dim=True), False, False, 0)
+        gone.pack_start(wrapped("Received files and your OmDrop name are kept.", dim=True), False, False, 0)
+        self.gone_note = wrapped("")
+        gone.pack_start(self.gone_note, False, False, 0)
+        self.pages.add_named(scrolled(gone), "uninstall")
+        self.card.pack_start(self.pages, True, True, 0)
+
+        # The corner: where things live, and the way out.
+        self.corner = Gtk.Box(spacing=8)
+        files = wrapped("Program   /usr/lib/omdrop\nSettings  /etc/omdrop\nLedger    /var/lib/omdrop-installer", dim=True)
+        files.get_style_context().add_class("omdrop-small")
+        self.corner.pack_start(files, True, True, 0)
+        out = Gtk.Button(label="Uninstall…")
+        out.set_relief(Gtk.ReliefStyle.NONE)
+        out.get_style_context().add_class("omdrop-small")
+        out.connect("clicked", lambda *_: self.go_to("uninstall"))
+        self.corner.pack_end(out, False, False, 0)
+        self.corner_slot = Gtk.Stack()
+        self.corner_slot.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.corner_slot.set_transition_duration(400)
+        self.corner_slot.add_named(Gtk.Box(), "empty")
+        self.corner_slot.add_named(self.corner, "corner")
+        self.card.pack_start(self.corner_slot, False, False, 0)
+
+        buttons = Gtk.Box(spacing=6)
+        self.back = Gtk.Button()
+        self.back.connect("clicked", self.on_back)
+        buttons.pack_start(self.back, False, False, 0)
+        self.next = Gtk.Button()
+        self.next.connect("clicked", self.on_next)
+        buttons.pack_end(self.next, False, False, 0)
+        self.card.pack_start(buttons, False, False, 2)
+
+        for step, handler in ((self.check, self.run_check), (self.install, self.on_install),
+                              (self.detect, self.on_detect)):
+            step.button.connect("clicked", lambda *_, h=handler: h())
+        self.connect("delete-event", lambda *_: self.close() or True)
+        self.connect("key-press-event", lambda w, e: e.keyval == Gdk.KEY_Escape and self.close())
+        self.card.show_all()
+        self.corner_slot.set_visible_child_name("corner" if self.configuring else "empty")
+        if self.configuring:
+            self.install.set("ok", "Installed.")
+            self.show_ledger()
+            self.fill_modes()
+        self.run_check()
+
+    def show_ledger(self):
+        lines = ledger_lines()
+        self.ledger.set_text("Ledger, newest first:\n" + "\n".join(lines) if lines else "")
+        self.ledger.set_visible(bool(lines))
+
+    # -- state
+
+    def installed(self):
+        return os.access(HELPER, os.X_OK)
+
+    def busy(self):
+        return self.proc is not None
+
+    def ready(self, page):
+        return (bool(self.go), self.installed(), self.detected or bool(self.mode_buttons),
+                self.chosen() is not None)[page]
+
+    def update(self):
+        busy = self.busy()
+        done = self.installed()
+        self.check.button.set_sensitive(not busy)
+        self.install.button.set_label("Reinstall" if done else "Install")
+        self.install.button.set_sensitive(bool(self.go) and not busy and self.tool is not None)
+        self.detect.button.set_sensitive(done and not busy)
+        for i, (chip, dot) in enumerate(self.chips):
+            step = self.steps[i]
+            paint(dot, SetupStep.MARKS[step.state], SetupStep.COLOURS.get(step.state))
+            here = self.page if isinstance(self.page, int) else len(self.steps)
+            reachable = self.configuring or i <= here or all(self.ready(j) for j in range(i))
+            chip.set_sensitive(reachable and not busy)
+            ctx = chip.get_style_context()
+            (ctx.add_class if i == self.page else ctx.remove_class)("omdrop-chip-here")
+        leaving = self.page == "uninstall"
+        if leaving:
+            self.back.set_label("Back")
+            self.next.set_label("Uninstall")
+            on = not busy and self.tool is not None
+            self.aside.set_text("")
+        elif self.configuring:
+            self.back.set_label("Close")
+            self.next.set_label("Save" if self.page == 3 else "Next")
+            on = (self.page < 3 or self.chosen() is not None) and not busy
+            self.aside.set_text("")
+        else:
+            self.back.set_label("Cancel" if self.page == 0 else "Back")
+            self.next.set_label("Finish" if self.page == 3 else "Next")
+            on = self.ready(self.page) and not busy
+            self.aside.set_text(f"step {self.page + 1} of 4")
+        self.back.set_sensitive(not busy)
+        self.next.set_sensitive(on)
+        # Colour only when it can be pressed: grey and still, then green (or red) and ready.
+        ctx = self.next.get_style_context()
+        for c in ("suggested-action", "destructive-action"):
+            ctx.remove_class(c)
+        if on:
+            ctx.add_class("destructive-action" if leaving else "suggested-action")
+        self.pages.set_visible_child_name(str(self.page))
+
+    def go_to(self, page):
+        self.page = page
+        self.update()
+
+    def on_back(self, _button):
+        if self.page == "uninstall":
+            self.go_to(0)
+        elif self.page == 0 or self.configuring:
+            self.close()
+        else:
+            self.go_to(self.page - 1)
+
+    def on_next(self, _button):
+        if self.page == "uninstall":
+            self.uninstall()
+        elif self.page == 3:
+            self.save_mode()
+        else:
+            self.go_to(self.page + 1)
+
+    def run(self, args, step, on_line, on_done, env=None):
+        step.set("busy")
+        self.proc = run_streaming([self.tool, *args], on_line,
+                                  lambda rc: (setattr(self, "proc", None), on_done(rc), self.update()), env)
+        self.update()
+
+    # -- the steps
+
+    def run_check(self):
+        if not self.tool:
+            self.check.set("fail", "omdrop-installer wasn't found; run install.sh again.")
+            return
+        out = []
+
+        def done(rc):
+            try:
+                result = json.loads(out[-1])
+            except (ValueError, IndexError):
+                self.check.set("fail", "The check didn't run.")
+                return
+            notes = [c["text"] for c in result["checks"] if c["level"] != "GO"]
+            self.go = result["verdict"] != "NOGO"
+            state = {"GO": "ok", "WARN": "warn", "NOGO": "fail"}[result["verdict"]]
+            verdict = {"GO": "GO", "WARN": "GO, with warnings", "NOGO": "NO-GO"}[result["verdict"]]
+            self.check.set(state, "\n".join([verdict] + notes))
+        self.run(["check", "--json"], self.check, out.append, done)
+
+    def on_install(self):
+        def done(rc):
+            if rc == 0:
+                self.install.set("ok", "Installed. Uninstall… is in the corner below.")
+                self.show_ledger()
+                self.corner_slot.set_visible_child_name("corner")
+                self.fill_modes()
+            else:
+                self.install.set("fail", self.install.detail.get_text() or "The install failed.")
+        self.run(["install"], self.install, lambda line: line.strip() and self.install.set("busy", line.strip()), done)
+
+    def on_detect(self):
+        out = []
+
+        def line(text):
+            if text.startswith("{"):
+                out.append(text)
+            elif text.strip():
+                self.detect.set("busy", text.strip() + " Wi-Fi may drop meanwhile.")
+
+        def done(rc):
+            self.detected = True
+            try:
+                result = json.loads(out[-1])
+            except (ValueError, IndexError):
+                self.detect.set("fail", "Detection didn't finish.")
+                return
+            self.recommended = result.get("recommended") or None
+            self.failed = {t["mode"]: short_reason(t) for t in result.get("results", [])
+                           if not (t.get("started") and t.get("awdl"))}
+            lines = [trial_line(t, t["mode"] == self.recommended) for t in result.get("results", [])]
+            self.detect.set("ok" if self.recommended else "fail", "\n".join(lines) or "No mode brought OmDrop up.")
+            self.fill_modes()
+        self.run(["detect", "--json"], self.detect, line, done)
+
+    def fill_modes(self):
+        try:
+            caps = json.loads(subprocess_output([HELPER, "caps"]))
+        except ValueError:
+            caps = {}
+        available = ["shared"] if caps.get("monitor") else []
+        available += ["exclusive"] if caps.get("ibss") else []
+        available += ["active-monitor"] if caps.get("active_monitor") else []
+        current = caps.get("profile") if caps.get("tested") else None
+        for child in self.mode_box.get_children():
+            self.mode_box.remove(child)
+        self.mode_buttons, group = {}, None
+        for mode in sorted(available, key=lambda m: m != self.recommended):
+            name, cost = MODES[mode]
+            tag = " · recommended" if mode == self.recommended else (" · current" if mode == current else "")
+            if mode in self.failed:
+                tag = f" · didn't start here ({self.failed[mode]})"
+            radio = Gtk.RadioButton.new_with_label_from_widget(group, f"{name}: {cost}{tag}")
+            radio.get_child().set_line_wrap(True)
+            radio.connect("toggled", lambda *_: self.update())
+            group = group or radio
+            self.mode_box.pack_start(radio, False, False, 0)
+            self.mode_buttons[mode] = radio
+        usable = [m for m in available if m not in self.failed]
+        pick = self.recommended or (current if current in usable else None) or (usable[0] if usable else None)
+        if pick:
+            self.mode_buttons[pick].set_active(True)
+        if current and self.choose.state == "todo":
+            self.choose.set("ok", "")
+        self.mode_box.show_all()
+        self.update()
+
+    def chosen(self):
+        return next((m for m, b in self.mode_buttons.items() if b.get_active()), None)
+
+    def save_mode(self):
+        mode = self.chosen()
+
+        def done(rc):
+            if rc != 0:
+                self.choose.set("fail", "Couldn't save the mode.")
+                return
+            self.choose.set("ok", "Saved: %s. It applies the next time OmDrop turns on." % MODES[mode][0])
+            self.fill_modes()
+            self.tray.setup_done()
+            if not self.configuring:
+                self.destroy()
+        self.run(["configure", mode], self.choose, lambda line: None, done)
+
+    def uninstall(self):
+        def done(rc):
+            if rc == 0:
+                self.gone_note.set_text("Uninstalled. What was there before is back.")
+                GLib.timeout_add(2500, lambda: self.tray.quit() and False)
+            else:
+                self.gone_note.set_text("Uninstall didn't finish.")
+        self.gone_note.set_text("Uninstalling…")
+        self.run(["uninstall"], self.choose, lambda line: line.strip() and self.gone_note.set_text(line.strip()),
+                 done, {"OMDROP_FROM_TRAY": "1"})
+
+    def close(self):
+        if not self.proc:
+            self.destroy()
+        return True
+
+
+def short_reason(trial):
+    """Why a trial failed, in a few words."""
+    reason = (trial.get("reason") or "").split(",")[0].split(" (")[0].strip().rstrip(".")
+    return reason or ("OmDrop didn't come up" if trial.get("started") else "it couldn't start")
+
+
+def scrolled(child):
+    """child in a fixed-height page: long content scrolls instead of growing the window."""
+    box = Gtk.ScrolledWindow()
+    box.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    box.add(child)
+    return box
+
+
+LEDGER_WORDS = {"new": "added", "saved": "replaced, original kept:", "pkg": "installed package",
+                "gone": "removed package", "omdrop-cli": "set up the omdrop command in"}
+
+
+def ledger_lines(paths=None):
+    """Every ledger entry in words, the most recent write first."""
+    out = []
+    home = os.path.expanduser("~")
+    for path in reversed(paths or LEDGERS):      # yours is written after the system's
+        try:
+            lines = open(path).read().splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if not line or line.startswith("#"):
+                continue
+            what, _, arg = line.partition(" ")
+            arg = arg.replace(home, "~", 1) if arg.startswith(home) else arg
+            if what in ("ufw", "firewalld"):
+                out.append(f"opened TCP 8771 on awdl0 ({'UFW' if what == 'ufw' else 'firewalld'})")
+            else:
+                out.append(f"{LEDGER_WORDS.get(what, what)} {arg}".strip())
+    return out
+
+
+LEDGERS = ("/var/lib/omdrop-installer/ledger",
+           os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                        "omdrop-installer", "ledger"))
+
+
+def plural(n, one, many):
+    return f"{n} {one if n == 1 else many}"
+
+
+def ledger_summary(paths=LEDGERS):
+    """What uninstall will undo, in a few lines, from the install ledgers."""
+    seen = {"new": 0, "saved": 0, "pkg": 0, "rule": 0, "cli": 0, "gone": 0}
+    before = []
+    for path in paths:
+        try:
+            lines = open(path).read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            what = line.split(" ", 1)[0]
+            if line.startswith("# before: "):
+                if line[len("# before: "):] not in before:
+                    before.append(line[len("# before: "):])
+            elif what in ("new", "saved", "pkg", "gone"):
+                seen[what] += 1
+            elif what in ("ufw", "firewalld"):
+                seen["rule"] += 1
+            elif what == "omdrop-cli":
+                seen["cli"] += 1
+    out = []
+    if seen["new"]:
+        out.append(f"Removes {plural(seen['new'], 'file and folder', 'files and folders')} it added")
+    if seen["saved"]:
+        out.append(f"Puts back {seen['saved']} it replaced")
+    if seen["pkg"]:
+        out.append(f"Removes {plural(seen['pkg'], 'package', 'packages')} it installed, unless something else needs "
+                   f"{'it' if seen['pkg'] == 1 else 'them'}")
+    if seen["rule"]:
+        out.append("Removes its firewall rule")
+    if seen["cli"]:
+        out.append("Removes the omdrop command it set up")
+    if seen["gone"]:
+        out.append("Can't bring back the omdrop-owl package it replaced")
+    return out, before
+
+
+def subprocess_output(args):
+    try:
+        ok, out, _err, _rc = GLib.spawn_sync(None, args, None, GLib.SpawnFlags.SEARCH_PATH, None)
+        return out.decode() if ok else ""
+    except GLib.Error:
+        return ""
+
+
+def trial_line(t, recommended):
+    """One Detect HW result, in words."""
+    name = MODES.get(t.get("mode"), (t.get("mode"),))[0]
+    if not t.get("started"):
+        return f"✗ {name}: didn't start ({t.get('reason') or 'unknown'})"
+    gateway = {True: "router answered", False: "router didn't answer", None: "no router"}[t.get("gateway")]
+    mark = "★" if recommended else ("✓" if t.get("awdl") else "✗")
+    return f"{mark} {name}: OmDrop {'up' if t.get('awdl') else 'down'}, {t.get('peers', 0)} device(s), {gateway}"
+
+
+class Tray(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.cli = None
+        self.status = {}
+        self.state = "off"        # off, loading, on
+        self.busy = None          # "on" or "off" while that command runs
+        self.error = ""
+        self.remaining = None     # seconds, counted down locally between polls
+        self.settle = 0
+        self.counters = Counters()
+        self.icon = None
+        self.icon_props = {}
+        self.popup = None
+        self.layout = None        # what the popup last showed, to refit it on a change
+        self.dots = 0
+        self.last_x = self.last_y = 0
+        self.journal = None
+        self.backend = BACKEND(self)
+        self.discovering = False
+        self.found = []             # devices that answered before the window opened
+        self.send_window = None
+        self.chooser = None
+        self.sending = None         # {"peer", "paths", "progress"} while a send runs
+        self.send_result = ""
+        self.send_failed = False
+        self.discovery_note = None  # discovery's last (text, still looking)
+        self.symbolic_size = None   # what the panel draws symbolic icons at
+        self.fullcolor_size = None  # and full-colour ones
+        self.ring_dir = os.path.join(GLib.get_user_runtime_dir(), "omdrop-tray")
+        self.setup_window = None
+        self.setup_pending = SETUP or not os.access(HELPER, os.X_OK)
+        self.ring_fg = None
+
+    def do_activate(self):
+        if self.icon is not None:
+            self.open_setup() if self.setup_pending else self.show_popup()
+            return
+        self.hold()
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.cli = find_cli()
+        self.popup = Popup(self)
+        menu = Gtk.Menu()
+        configure = Gtk.MenuItem(label="Configure…")
+        configure.connect("activate", lambda *_: self.open_setup())
+        menu.append(configure)
+        menu.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem(label="Quit OmDrop status")
+        quit_item.connect("activate", lambda *_: self.quit())
+        menu.append(quit_item)
+        menu.show_all()
+        self.icon = PanelIcon(self.on_icon_click, self.on_icon_size, menu)
+
+        # Actions on the session bus, for scripts and keyboard shortcuts:
+        # org.gtk.Actions.Activate("turn-on", ["20m"], {}), "turn-off", "quit".
+        on = Gio.SimpleAction.new("turn-on", GLib.VariantType.new("s"))
+        on.connect("activate", lambda _a, span: self.turn_on(span.get_string()))
+        self.add_action(on)
+        off = Gio.SimpleAction.new("turn-off", None)
+        off.connect("activate", lambda *_: self.turn_off())
+        self.add_action(off)
+        setup_action = Gio.SimpleAction.new("setup", None)
+        setup_action.connect("activate", lambda *_: self.open_setup())
+        self.add_action(setup_action)
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", lambda *_: self.quit())
+        self.add_action(quit_action)
+
+        self.follow_journal()
+        GLib.timeout_add_seconds(1, self.tick)
+        GLib.timeout_add_seconds(POLL_SECONDS, self.poll)
+        self.poll()
+        self.render()
+
+    def do_shutdown(self):
+        self.counters.save()
+        if self.sending:
+            self.backend.cancel_send()
+        self.clear_rings()
+        Gtk.Application.do_shutdown(self)
+
+    # ------------------------------------------------------------ the CLI
+
+    def cli_call(self, args, done):
+        if not self.cli:
+            self.cli = find_cli()
+        if not self.cli:
+            self.error = "The omdrop command isn't installed. Run: omdrop-installer install"
+            self.render()
+            return
+        proc = Gio.Subprocess.new([self.cli, *args],
+                                  Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+
+        def finished(p, result):
+            try:
+                _, out, _ = p.communicate_utf8_finish(result)
+            except GLib.Error as e:
+                out = str(e)
+            done(p.get_exit_status() if p.get_if_exited() else 1, out or "")
+
+        proc.communicate_utf8_async(None, None, finished)
+
+    def poll(self):
+        def done(rc, out):
+            try:
+                self.status = json.loads(out)
+            except ValueError:
+                self.status = {}
+            self.update_state()
+        self.cli_call(["status", "--json"], done)
+        return True
+
+    def turn_on(self, span):
+        if span not in [arg for _label, _tip, arg in DURATIONS]:
+            self.error = f"Not a duration this panel offers: {span}"
+            self.render()
+            return
+        self.popup.duration.set_active_id(span)
+        self.busy, self.error = "on", ""
+        self.render()
+
+        def done(rc, out):
+            self.busy = None
+            if rc != 0:
+                lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+                self.error = lines[-1] if lines else "omdrop on failed"
+            self.poll()
+        # The chosen duration, passed as `omdrop on`'s window argument.
+        self.cli_call(["on", span], done)
+
+    def turn_off(self):
+        self.busy, self.error = "off", ""
+        self.render()
+
+        def done(rc, out):
+            self.busy = None
+            if rc != 0:
+                lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+                self.error = lines[-1] if lines else "omdrop off failed"
+            self.poll()
+        self.cli_call(["off"], done)
+
+    def set_legacy(self, on):
+        try:
+            if on:
+                os.makedirs(os.path.dirname(LEGACY_FLAG), exist_ok=True)
+                open(LEGACY_FLAG, "a").close()
+            elif os.path.exists(LEGACY_FLAG):
+                os.remove(LEGACY_FLAG)
+        except OSError as e:
+            self.error = f"Couldn't change the send rate: {e.strerror}"
+        if self.status.get("receiving"):
+            self.send_result = "The new rate applies the next time OmDrop turns on."
+            self.send_failed = False
+        self.render()
+
+    def reset_counters(self):
+        self.counters.reset()
+        self.render()
+
+    def download_dir(self):
+        return self.status.get("dir") or GLib.get_user_special_dir(
+            GLib.UserDirectory.DIRECTORY_DOWNLOAD) or os.path.expanduser("~/Downloads")
+
+    def open_folder(self):
+        path = self.download_dir()
+        try:
+            Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), None)
+            self.popup.hide()
+        except GLib.Error as e:
+            self.error = f"Couldn't open {path}: {e.message}"
+            self.render()
+
+    # ------------------------------------------------------------ sending
+
+    def send_files(self):
+        """Send Files: start finding devices, then ask for the files."""
+        if self.sending or self.chooser or self.send_window:
+            if self.send_window:
+                self.send_window.present()
+            return
+        self.popup.hide()
+        self.send_result = ""
+        self.found = []
+        self.discovering = True
+        self.backend.start_discovery(self.on_peer, self.on_discovery_status)
+        self.chooser = Gtk.FileChooserNative.new(
+            "Choose files to send", None, Gtk.FileChooserAction.OPEN, "_Choose", "_Cancel")
+        self.chooser.set_select_multiple(True)
+        self.chooser.set_local_only(True)
+        self.chooser.connect("response", self.on_chosen)
+        self.chooser.show()
+
+    def on_chosen(self, chooser, response):
+        paths = [f.get_path() for f in chooser.get_files()] if response == Gtk.ResponseType.ACCEPT else []
+        self.chooser = None
+        paths = [p for p in paths if p]
+        if not paths:
+            self.end_discovery(abandoned=True)
+            return
+        self.send_window = SendWindow(self, paths)
+        self.send_window.connect("destroy", lambda *_: setattr(self, "send_window", None))
+        for peer in self.found:
+            self.send_window.add_peer(peer)
+        if self.discovery_note:
+            self.send_window.set_search_status(*self.discovery_note)
+        self.send_window.show()
+        self.send_window.refit()
+        self.send_window.present()
+
+    def on_peer(self, peer):
+        if not self.discovering:
+            return
+        self.found.append(peer)
+        if self.send_window:
+            self.send_window.add_peer(peer)
+
+    def on_discovery_status(self, text, busy=True):
+        self.discovery_note = (text, busy)
+        if self.send_window:
+            self.send_window.set_search_status(text, busy)
+
+    def end_discovery(self, abandoned=False):
+        if self.discovering:
+            self.discovering = False
+            self.backend.stop_discovery()
+            if abandoned:
+                self.backend.discovery_abandoned()
+        self.found = []
+        self.discovery_note = None
+
+    def start_send(self, peers, paths):
+        """Send paths to each of peers in turn, OmDrop staying on between."""
+        self.end_discovery()
+        self.clear_rings()
+        self.sending = {"peers": list(peers), "index": -1, "paths": paths,
+                        "progress": 0.0, "text": "", "sent": [], "failed": []}
+        self.send_next()
+
+    def send_next(self):
+        sending = self.sending
+        sending["index"] += 1
+        if sending["index"] >= len(sending["peers"]):
+            self.sending = None
+            self.send_result, self.send_failed = send_summary(sending)
+            self.backend.finish()
+            self.clear_rings()
+            self.render()
+            return
+        sending["peer"] = sending["peers"][sending["index"]]
+        sending["text"] = ""
+        self.on_send_progress(0.0)
+        self.backend.send(sending["peer"], sending["paths"], self.on_send_progress, self.on_send_done)
+
+    def on_send_progress(self, fraction, text=""):
+        sending = self.sending
+        if sending:
+            # The ring covers every recipient: each is an equal share of it.
+            n = len(sending["peers"])
+            fraction = max(0.0, min(1.0, fraction))
+            sending["progress"] = (sending["index"] + fraction) / n
+            sending["text"] = text or sending["text"]
+            self.render()
+
+    def on_send_done(self, ok, message=""):
+        sending = self.sending
+        if not sending:
+            return
+        who = peer_label(sending["peer"])
+        if ok:
+            sending["sent"].append(who)
+            self.counters.add_files(len(sending["paths"]))
+        else:
+            sending["failed"].append((who, message))
+        self.send_next()
+
+    def cancel_send(self):
+        sending = self.sending
+        if sending:
+            self.backend.cancel_send()
+            sending["failed"].append((peer_label(sending["peer"]), "cancelled"))
+            sending["index"] = len(sending["peers"]) - 1    # skip the rest
+            self.send_next()
+
+    def open_setup(self):
+        """The configurator takes the panel's place, and stays where it opened."""
+        self.popup.hide()
+        if self.setup_window is None:
+            self.setup_window = ConfigWindow(self)
+            self.setup_window.connect("destroy", lambda *_: setattr(self, "setup_window", None))
+            self.setup_window.show()
+            self.setup_window.refit()
+        self.setup_window.present()
+
+    def setup_done(self):
+        self.setup_pending = False
+        self.cli = find_cli()
+        self.poll()
+        self.render()
+
+    def place_window(self, window):
+        place_near(window, self.last_x, self.last_y)
+
+    # -- the ring
+
+    def on_icon_size(self, size):
+        if not size:
+            return
+        if str(self.icon_props.get("icon_name", "")).endswith("-symbolic"):
+            self.symbolic_size = size
+        elif self.sending:
+            if size != self.fullcolor_size:
+                self.fullcolor_size = size
+                self.render()
+
+    def ring_icon(self, progress):
+        """The ring's SVG for this progress, written once per whole percent."""
+        if self.ring_fg is None:
+            self.ring_fg = panel_icon_colour()
+        canvas = self.fullcolor_size or 32
+        symbolic = min(self.symbolic_size or 16, canvas * 0.7)
+        pct = int(progress * 100)
+        path = os.path.join(self.ring_dir, f"ring-{canvas}-{int(symbolic)}-{pct:03d}.svg")
+        if not os.path.exists(path):
+            os.makedirs(self.ring_dir, exist_ok=True)
+            with open(path, "w") as f:
+                f.write(ring_svg(pct / 100, canvas, symbolic, self.ring_fg))
+        return path
+
+    def clear_rings(self):
+        try:
+            for name in os.listdir(self.ring_dir):
+                if name.startswith("ring-") and name.endswith(".svg"):
+                    os.remove(os.path.join(self.ring_dir, name))
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------ files
+
+    def follow_journal(self):
+        """Count files as the receiver logs storing them, from now on."""
+        if not shutil.which("journalctl"):
+            return
+        try:
+            self.journal = Gio.Subprocess.new(
+                ["journalctl", "--user", "-u", RECEIVER_UNIT, "-f", "-n", "0", "-o", "cat"],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+        except GLib.Error:
+            return
+        stream = Gio.DataInputStream.new(self.journal.get_stdout_pipe())
+
+        def got_line(s, result):
+            try:
+                line, _ = s.read_line_finish_utf8(result)
+            except GLib.Error:
+                line = None
+            if line is None:
+                # journalctl ended; follow again shortly.
+                GLib.timeout_add_seconds(10, lambda: self.follow_journal() and False)
+                return
+            n = files_in_log_line(line)
+            if n:
+                self.counters.add_files(n)
+                self.counters.save()
+                self.render()
+            s.read_line_async(GLib.PRIORITY_DEFAULT, None, got_line)
+
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, got_line)
+
+    # ------------------------------------------------------------ state
+
+    def update_state(self):
+        s = self.status
+        receiving = bool(s.get("receiving"))
+        visible = s.get("visible")
+        rem = s.get("remaining")
+        self.remaining = rem if isinstance(rem, int) else None
+
+        if self.busy:
+            self.state = "loading"
+        elif not receiving:
+            self.state = "off"
+        elif visible is True:
+            self.state = "on"
+        elif self.settle < SETTLE_LIMIT:
+            self.state = "loading"   # the radio is still coming up
+        else:
+            self.state = "on"        # up, but unseen: the detail line says so
+        self.render()
+
+    def tick(self):
+        if self.status.get("receiving") and self.status.get("visible") is not True:
+            self.settle += 1
+        else:
+            self.settle = 0
+        if self.remaining is not None and self.remaining > 0:
+            self.remaining -= 1
+            if self.remaining == 0:
+                self.poll()   # the timer is turning it off right now
+        self.counters.sample(1)
+        if self.dots == 0:
+            self.counters.save()   # every third second at most
+        self.dots = (self.dots + 1) % 3
+        self.render()
+        return True
+
+    # ------------------------------------------------------------ drawing
+
+    def view(self):
+        """off, loading or on, with a running command counting as loading."""
+        if self.busy:
+            return "loading"
+        return self.state
+
+    def detail_text(self, view):
+        if self.error:
+            return self.error
+        if not self.cli:
+            return "The omdrop command isn't installed. Run: omdrop-installer install"
+        s = self.status
+        if not s:
+            return ""
+        name = s.get("name") or "this computer"
+        if self.busy == "off":
+            return "Turning OmDrop off."
+        if view == "off":
+            return f'Nearby Apple devices can\'t see "{name}".'
+        if view == "loading":
+            return "Waking the radio. This takes 10 to 60 seconds."
+        if s.get("visible") is True:
+            return f'Visible to nearby Apple devices as "{name}".'
+        reason = s.get("reason")
+        return "The receiver is up, but nothing is advertising on the radio" + \
+            (f" ({reason})." if reason else ".")
+
+    def render(self):
+        view = self.view()
+        dots = "." * (self.dots + 1)
+        names = {"on": "On", "off": "Off", "loading": "Loading" + dots}
+        mode = self.status.get("mode")
+        timed = self.remaining is not None and view != "off"
+        clock = format_clock(self.remaining) if timed else ""
+        rate = format_rate(self.counters.rate)
+        received = f"{format_size(self.counters.transferred)}, {format_files(self.counters.files)}"
+
+        # The countdown sits beside the icon in the panel while a window runs.
+        # Only changes go to the panel: each call is a D-Bus message.
+        sending = self.sending
+        if sending:
+            who = peer_label(sending["peer"])
+            pct = int(sending["progress"] * 100)
+            text = sending["text"] or f"Sending {format_files(len(sending['paths']))} to {who}"
+            # A percentage once bytes are moving; before that, what it waits for.
+            send_text = f"{text}: {pct}%" if text.startswith("Sending ") else text
+            n = len(sending["peers"])
+            if n > 1:
+                send_text = f"{sending['index'] + 1} of {n} · {send_text}"
+            self.icon_set("icon_name", self.ring_icon(sending["progress"]))
+            self.icon_set("label", "")
+        else:
+            self.icon_set("icon_name", panel_icon(view))
+            self.icon_set("label", clock if view == "on" and timed else "")
+        tip = f"OmDrop: {names[view].rstrip('.')}"
+        if view == "on":
+            tip += f" · {clock} left" if timed else " · indefinitely"
+            tip += f"\nActivity: {rate}"
+        tip += f"\nData transferred: {received}"
+        if self.setup_pending:
+            tip = "OmDrop: click to set up"
+        if sending:
+            tip = send_text + "\n" + tip
+        self.icon_set("tooltip_text", tip)
+
+        p = self.popup
+        icon = icon_path(view)
+        p.head_icon.set_from_gicon(Gio.FileIcon.new(Gio.File.new_for_path(icon))
+                                   if os.path.isabs(icon) else Gio.ThemedIcon.new(icon),
+                                   Gtk.IconSize.DND)
+        p.state_label.set_text(names[view])
+        ctx = p.state_label.get_style_context()
+        for s in ("on", "off", "loading"):
+            ctx.remove_class(f"omdrop-state-{s}")
+        ctx.add_class(f"omdrop-state-{view}")
+
+        if view == "off":
+            p.stack.set_visible_child_name("off")
+            p.toggle.set_label("Turn On")
+            p.toggle.get_style_context().add_class("suggested-action")
+            p.toggle.set_sensitive(self.cli is not None)
+        else:
+            p.stack.set_visible_child_name("on")
+            p.toggle.get_style_context().remove_class("suggested-action")
+            p.toggle.set_label("Turning off…" if self.busy == "off" else "Turn Off")
+            p.toggle.set_sensitive(self.busy is None)
+            if view == "loading" and not self.status.get("receiving"):
+                p.clock_title.set_text("Loading" + dots)
+                p.clock.set_text("")
+                p.window_label.set_text("Starting OmDrop")
+            else:
+                p.clock_title.set_text("Time left")
+                if timed:
+                    p.clock.set_text(clock)
+                    p.window_label.set_text("")
+                elif mode == "once":
+                    p.clock.set_text("—")
+                    p.window_label.set_text("Until one file arrives")
+                else:
+                    p.clock.set_text("∞")
+                    p.window_label.set_text("Until you turn it off")
+            p.window_label.set_visible(bool(p.window_label.get_text()))
+            p.activity.set_text(rate)
+        p.received.set_text(received)
+        p.reset.set_sensitive(bool(self.counters.transferred or self.counters.files))
+        p.folder.set_tooltip_text(f"Open the OmDrop downloads folder ({self.download_dir()})")
+
+        p.send_button.set_visible(not sending)
+        p.send_button.set_sensitive(self.cli is not None and not self.send_window)
+        p.sending_box.set_visible(bool(sending))
+        if sending:
+            p.sending_label.set_text(send_text)
+            p.sending_bar.set_fraction(sending["progress"])
+
+        detail = self.detail_text(view)
+        if self.send_result and not self.error:
+            detail = self.send_result
+        p.detail.set_text(detail)
+        p.detail.set_visible(bool(detail))
+        dctx = p.detail.get_style_context()
+        failed = self.error or (self.send_result and self.send_failed and detail == self.send_result)
+        (dctx.add_class if failed else dctx.remove_class)("omdrop-error")
+
+        # Refit and re-anchor only when the popup's shape can change, not on
+        # every tick.
+        layout = (view, p.window_label.get_visible(), detail, bool(sending))
+        if p.get_visible() and layout != self.layout:
+            p.resize(1, 1)
+            p.place(self.last_x, self.last_y)
+        self.layout = layout
+
+    # ------------------------------------------------------------ the icon
+
+    def icon_set(self, prop, value):
+        if self.icon_props.get(prop) != value:
+            self.icon_props[prop] = value
+            getattr(self.icon, "set_" + prop)(value)
+
+    def on_icon_click(self, x, y):
+        self.last_x, self.last_y = x, y
+        if self.setup_pending:
+            self.open_setup()
+        elif self.popup.get_visible():
+            self.popup.hide()
+        else:
+            self.show_popup()
+
+    def show_popup(self):
+        self.poll()
+        self.layout = None
+        self.render()
+        self.popup.show()
+        self.popup.resize(1, 1)
+        self.popup.place(self.last_x, self.last_y)
+        self.popup.present()
+
+
+def self_test():
+    assert format_rate(0) == "0 Kb/s"
+    assert format_rate(999_999) == "999 Kb/s"          # rounded down, never up
+    assert format_rate(2_900_000) == "2 Mb/s"
+    assert format_rate(3e9) == "3 Gb/s"
+    assert format_rate(4.2e12) == "4 Tb/s"
+    assert format_size(999) == "0 KB"
+    assert format_size(44_548_140) == "44 MB"
+    assert format_size(1_999_999_999) == "1 GB"
+    assert format_files(1) == "1 file" and format_files(3) == "3 files"
+    assert format_clock(65) == "1:05" and format_clock(3725) == "1:02:05"
+    assert files_in_log_line("INFO root: upload 1A2B: stored IMG_5888.PNG") == 1
+    assert files_in_log_line("INFO root: upload 1A2B: stored a.jpg, b.jpg,c.mov") == 3
+    assert files_in_log_line("INFO root: link stored as x.url -> https://e.org") == 1
+    assert files_in_log_line("INFO root: upload 1A2B: 30% of free bytes") == 0
+
+    # Counters across a recreated awdl0, against a stand-in sysfs dir.
+    import tempfile
+    global AWDL, STATE_FILE
+    AWDL = tempfile.mkdtemp()
+    STATE_FILE = os.path.join(tempfile.mkdtemp(), "counters.json")
+    os.makedirs(os.path.join(AWDL, "statistics"))
+
+    def awdl(ifindex, rx, tx):
+        for name, v in (("ifindex", ifindex), ("statistics/rx_bytes", rx),
+                        ("statistics/tx_bytes", tx)):
+            with open(os.path.join(AWDL, name), "w") as f:
+                f.write(str(v))
+    c = Counters()
+    awdl(7, 1000, 500); c.sample(1)
+    assert c.transferred == 1500
+    awdl(7, 126000, 1500); c.sample(1)
+    assert c.transferred == 127500 and c.rate == (125000 + 1000) * 8
+    c.save()
+    c2 = Counters()                            # a restart mid-session: no double count
+    awdl(7, 127000, 2500); c2.sample(1)
+    assert c2.transferred == 129500
+    awdl(9, 400, 100); c2.sample(1)            # a new awdl0, counting from zero
+    assert c2.transferred == 130000 and c2.rate == 0
+    c2.add_files(2)
+    c2.reset()
+    assert (c2.transferred, c2.files) == (0, 0) and Counters().transferred == 0
+    with open(STATE_FILE, "w") as f:           # an inbound-only count carries over
+        json.dump({"received": 5000, "files": 3, "ifindex": 9, "last_rx": 400}, f)
+    c3 = Counters()
+    awdl(9, 600, 300); c3.sample(1)
+    assert (c3.transferred, c3.files) == (5000, 3)
+    awdl(9, 700, 400); c3.sample(1)
+    assert c3.transferred == 5200
+    shutil.rmtree(AWDL)
+
+    # What Send Files accepts.
+    d = tempfile.mkdtemp()
+    ok = os.path.join(d, "photo.jpg")
+    with open(ok, "wb") as f:
+        f.write(b"x")
+    os.symlink(ok, os.path.join(d, "link.jpg"))
+    os.symlink(os.path.join(d, "gone"), os.path.join(d, "broken.jpg"))
+    locked = os.path.join(d, "locked.jpg")
+    with open(locked, "wb") as f:
+        f.write(b"x")
+    os.chmod(locked, 0)
+    assert check_file(ok) is None
+    assert check_file(os.path.join(d, "link.jpg")) is None
+    assert check_file(os.path.join(d, "broken.jpg")) == "it's a broken link"
+    assert check_file(os.path.join(d, "missing.jpg")) == "it no longer exists"
+    assert check_file(d) == "it's a folder"
+    if os.geteuid() != 0:
+        assert check_file(locked) == "permission denied"
+    os.chmod(locked, 0o600)
+    other = os.path.join(d, "sub")
+    os.mkdir(other)
+    with open(os.path.join(other, "photo.jpg"), "wb") as f:
+        f.write(b"y")
+    dup = check_files([ok, os.path.join(other, "photo.jpg")])
+    assert dup[ok] is None and dup[os.path.join(other, "photo.jpg")] == "another file chosen has the same name"
+    shutil.rmtree(d)
+
+    # Reading omdrop's output.
+    assert peer_from_json({"mac": "aa:bb:cc:dd:ee:ff", "rssi": -50, "name": None}) == \
+        {"address": "aa:bb:cc:dd:ee:ff", "name": None, "rssi": -50}
+    assert peer_from_json({"rssi": -50}) is None
+    assert peer_label({"address": "aa:bb:cc:dd:ee:ff", "name": None}) == "Apple device (ee:ff)"
+    assert peer_label({"address": "aa:bb:cc:dd:ee:ff", "name": "iPhone"}) == "iPhone"
+    assert send_status("Preparing photo.jpg...", "iPhone") == "Preparing photo.jpg…"
+    assert send_status("waiting up to 30s for aa:bb to start listening on 8770", "iPhone") == \
+        "Waiting for iPhone to wake…"
+    assert send_status("sending /x/photo.jpg to aa:bb at [fe80::1]:8770", "iPhone") == \
+        "Waiting for iPhone to accept…"
+    assert send_status("something else", "iPhone") is None
+    assert estimate_progress(0, 100) == 0 and estimate_progress(50, 100) == 0.5
+    assert estimate_progress(500, 100) == 0.99 and estimate_progress(5, 0) == 0
+
+    # The ring: a gap at the top, the bar only once there is progress.
+    empty, half = ring_svg(0, 32, 14, "#ffffff"), ring_svg(0.5, 32, 14, "#ffffff")
+    assert RING_ACCENT not in empty and RING_ACCENT in half
+    assert half.count("<path") == len(GLYPH_PATHS) + 2
+    start = math.radians(-90 + RING_GAP_DEGREES / 2)
+    r = (14 * RING_DIAMETER - 14 * RING_STROKE) / 2
+    assert f"M {16 + r * math.cos(start):.3f} {16 + r * math.sin(start):.3f}" in half
+    # What uninstall will say it undoes.
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "root"), "w") as f:
+        f.write("# before: Linux Mint 22.3, kernel 7.0\npkg git\npkg iw\nnew /usr/lib/omdrop\n"
+                "saved /etc/omdrop\nufw\ngone omdrop-owl\n")
+    with open(os.path.join(d, "user"), "w") as f:
+        f.write("new /home/u/.local/bin/omdrop-tray\nomdrop-cli /home/u/.local/share/omdrop-plugin\n")
+    undo, before = ledger_summary((os.path.join(d, "root"), os.path.join(d, "user"), os.path.join(d, "none")))
+    assert before == ["Linux Mint 22.3, kernel 7.0"]
+    assert undo == ["Removes 2 files and folders it added", "Puts back 1 it replaced",
+                    "Removes 2 packages it installed, unless something else needs them",
+                    "Removes its firewall rule", "Removes the omdrop command it set up",
+                    "Can't bring back the omdrop-owl package it replaced"], undo
+    words = ledger_lines((os.path.join(d, "root"), os.path.join(d, "user")))
+    assert words[:2] == ["set up the omdrop command in /home/u/.local/share/omdrop-plugin",
+                         "added /home/u/.local/bin/omdrop-tray"], words
+    assert words[-1] == "installed package git" and "opened TCP 8771 on awdl0 (UFW)" in words
+    shutil.rmtree(d)
+    print("ok")
+
+
+SETUP = False
+
+
+def main():
+    global SETUP
+    if "--self-test" in sys.argv:
+        self_test()
+        return 0
+    SETUP = "--setup" in sys.argv
+    app = Tray()
+    if SETUP:
+        app.register(None)
+        if app.get_is_remote():
+            app.activate_action("setup", None)
+            return 0
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- omdrop-owl tray icon, loading: concentric rings over a wedge. Drawn for this project. -->
+  <circle cx="12" cy="12" r="11" fill="#FF9F0A" opacity="1"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="1.6" stroke-linecap="round">
+    <path d="M 8.25 18.5 A 7.5 7.5 0 1 1 15.75 18.5"/>
+    <path d="M 9.75 15.9 A 4.5 4.5 0 1 1 14.25 15.9"/>
+  </g>
+  <path d="M 12 11 L 14.6 20.6 L 9.4 20.6 Z" fill="#FFFFFF"/>
+</svg>

@@ -1,0 +1,7 @@
+# Fetched at a pinned commit by tools/stage.sh; never committed (GPL-2.0-only).
+/upstream/
+# The assembled runtime directory.
+/build/
+__pycache__
+# tools/rate-sweep.sh results: local measurements
+rate-sweep-*

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- omdrop-tray panel icon, on. Symbolic: the panel recolours it to match its own icons. -->
+  <path fill="#bebebe" d="M 4.375 14.279 A 7.25 7.25 0 1 1 11.625 14.279 L 10.875 12.980 A 5.75 5.75 0 1 0 5.125 12.980 Z"/>
+  <path fill="#bebebe" d="M 5.875 11.681 A 4.25 4.25 0 1 1 10.125 11.681 L 9.375 10.382 A 2.75 2.75 0 1 0 6.625 10.382 Z"/>
+  <path fill="#bebebe" d="M 8 7.6 L 10.1 15.5 L 5.9 15.5 Z"/>
+</svg>

@@ -1,0 +1,479 @@
+#!/bin/bash
+# Linux OmDrop Installer: check, install, detect hardware, configure, uninstall.
+#
+#   omdrop-installer                  the whole setup, in this terminal
+#   omdrop-installer check [--json]   go / no-go for this machine
+#   omdrop-installer install          dependencies, OWL, system files, omdrop CLI, tray
+#   omdrop-installer detect [--json]  try shared and single-radio modes; recommend one
+#   omdrop-installer configure MODE   shared | exclusive | active-monitor | reset
+#   omdrop-installer uninstall     undo the install, backwards, from its ledger
+#   omdrop-installer ledger        what the install changed
+set -uo pipefail
+
+SELF=$(readlink -f "$0")
+LIB=${OMDROP_LIB:-/usr/lib/omdrop}
+HELPER=${OMDROP_HELPER:-$LIB/omdrop-discoverable}
+ELEVATE=${OMDROP_ELEVATE:-pkexec}
+SRC=${OMDROP_SRC:-$(cd "$(dirname "$SELF")/.." 2>/dev/null && pwd)}
+[ -f "$SRC/tools/build-owl.sh" ] || SRC=${XDG_DATA_HOME:-$HOME/.local/share}/omdrop-installer/src
+PLUGIN_REPO=https://github.com/netmojo-systems/omdrop-plugin.git
+# The receiver's rule, as `omdrop firewall install` adds it.
+UFW_RULE=(allow in on awdl0 from fe80::/10 to fe80::/10 port 8771 proto tcp comment "OmDrop receiver")
+PLUGIN_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/omdrop-plugin
+DATA=${XDG_DATA_HOME:-$HOME/.local/share}
+STATE=${OMDROP_STATE:-/var/lib/omdrop-installer}
+USTATE=${XDG_STATE_HOME:-$HOME/.local/state}/omdrop-installer
+CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}
+export PATH="$HOME/.local/bin:$PATH"
+
+say() { printf '%s\n' "$*"; }
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+die() { printf 'omdrop-installer: %s\n' "$*" >&2; exit 1; }
+tty_read() { local r=''; read -r -p "$1" r < /dev/tty 2>/dev/null || true; printf '%s' "$r"; }
+
+# ------------------------------------------------------------- distro support
+
+pm() {
+  local p
+  for p in apt-get dnf zypper pacman; do command -v "$p" >/dev/null && { echo "$p"; return; }; done
+}
+
+# Package names per manager: build, runtime, tray.
+deps() {  # PM
+  case "$1" in
+    apt-get) echo "build-essential cmake git pkg-config libev-dev libpcap-dev libnl-3-dev libnl-genl-3-dev libnl-route-3-dev
+      iw iproute2 iputils-ping network-manager policykit-1 pkexec polkitd keyutils bluez python3 python3-libarchive-c python3-pil python3-zeroconf python3-ifaddr python3-dbus python3-gi python3-tomli
+      gir1.2-gtk-3.0 gir1.2-xapp-1.0 gir1.2-ayatanaappindicator3-0.1" ;;
+    dnf) echo "gcc gcc-c++ make cmake git pkgconf-pkg-config libev-devel libpcap-devel libnl3-devel
+      iw iproute iputils NetworkManager polkit keyutils bluez python3 python3-libarchive-c python3-pillow python3-zeroconf python3-ifaddr python3-dbus python3-gobject
+      gtk3 xapps libayatana-appindicator-gtk3" ;;
+    zypper) echo "gcc-c++ make cmake git pkg-config libev-devel libpcap-devel libnl3-devel
+      iw iproute2 iputils NetworkManager polkit keyutils bluez python3 python3-libarchive-c python3-Pillow python3-zeroconf python3-ifaddr python3-dbus-python python3-gobject
+      typelib-1_0-Gtk-3_0 typelib-1_0-AyatanaAppIndicator3-0_1" ;;
+    pacman) echo "base-devel cmake git libev libpcap libnl
+      iw iproute2 iputils networkmanager polkit keyutils bluez python python-libarchive-c python-pillow python-zeroconf python-ifaddr python-dbus python-gobject
+      gtk3 xapp libayatana-appindicator" ;;
+  esac
+}
+
+# Install what's available; a name this release lacks is skipped, not fatal.
+pm_install() {  # PM PKG...
+  local m=$1; shift
+  case "$m" in
+    apt-get) apt-get update -qq; apt-get install -y -qq "$@" 2>/dev/null && return
+      for p in "$@"; do apt-get install -y -qq "$p" >/dev/null 2>&1 || say "  skipped $p"; done ;;
+    dnf) dnf install -y -q --skip-unavailable "$@" 2>/dev/null || dnf install -y -q --setopt=strict=0 "$@" ;;
+    zypper) for p in "$@"; do zypper -n -q install "$p" >/dev/null 2>&1 || say "  skipped $p"; done ;;
+    pacman) pacman -S --noconfirm --needed "$@" 2>/dev/null && return
+      for p in "$@"; do pacman -S --noconfirm --needed "$p" >/dev/null 2>&1 || say "  skipped $p"; done ;;
+  esac
+}
+
+tray_backend() {
+  python3 - <<'EOF' 2>/dev/null || echo none
+import gi
+gi.require_version("Gtk", "3.0")
+for ns, v, name in (("XApp", "1.0", "xapp"), ("AyatanaAppIndicator3", "0.1", "ayatana")):
+    try:
+        gi.require_version(ns, v); __import__("gi.repository." + ns); print(name); break
+    except (ValueError, ImportError):
+        pass
+else:
+    print("none")
+EOF
+}
+
+has_display() { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; }
+
+# ---------------------------------------------------------------------- check
+
+wifi_iface() { for d in /sys/class/net/*/wireless; do [ -e "$d" ] && { basename "$(dirname "$d")"; return; }; done; }
+
+# Lines "GO|WARN|NOGO <reason>"; the verdict is the worst of them.
+checks() {
+  local iface phy info py
+  [ "$(uname -s)" = Linux ] || echo "NOGO not Linux"
+  command -v systemctl >/dev/null && echo "GO systemd" || echo "NOGO no systemd (the omdrop receiver is a systemd user service)"
+  [ -n "$(pm)" ] && echo "GO package manager: $(pm)" || echo "WARN no apt, dnf, zypper or pacman: install dependencies by hand"
+  py=$(python3 -c 'import sys; print("%d%02d" % sys.version_info[:2])' 2>/dev/null || echo 0)
+  if [ "$py" -ge 310 ]; then echo "GO python3"; else echo "NOGO python 3.10 or newer is needed"; fi
+  iface=$(wifi_iface)
+  if [ -z "$iface" ]; then echo "NOGO no Wi-Fi interface"; else
+    echo "GO Wi-Fi: $iface ($(basename "$(readlink -f "/sys/class/net/$iface/device/driver")" 2>/dev/null))"
+    phy=$(basename "$(readlink -f "/sys/class/net/$iface/phy80211")")
+    if command -v iw >/dev/null; then
+      info=$(iw phy "$phy" info 2>/dev/null)
+      grep -q '\* monitor' <<< "$info" && echo "GO monitor mode" || echo "NOGO the card has no monitor mode, which OmDrop needs"
+      grep -q -e '\* IBSS' -e 'supports active monitor' <<< "$info" \
+        && echo "GO single-radio mode" || echo "WARN no ad-hoc or active monitor: shared mode only"
+    else
+      echo "WARN iw isn't installed yet: radio modes are checked after install"
+    fi
+    iw dev "$iface" link 2>/dev/null | grep -q '^Connected' \
+      && echo "GO Wi-Fi connected" || echo "WARN Wi-Fi not connected: shared mode can't be tried"
+  fi
+  if systemctl is-active --quiet NetworkManager 2>/dev/null; then echo "GO NetworkManager"
+  else echo "NOGO NetworkManager isn't running (it hands Wi-Fi back after OmDrop)"; fi
+  [ -n "$(ls /sys/class/bluetooth 2>/dev/null)" ] && echo "GO Bluetooth" || echo "WARN no Bluetooth: iPhones wake slower to sends"
+  if has_display; then
+    case "$(tray_backend)" in
+      none) echo "WARN no tray library yet: installed with the dependencies" ;;
+      *) echo "GO tray: $(tray_backend)" ;;
+    esac
+  else
+    echo "GO no display: terminal setup"
+  fi
+}
+
+cmd_check() {
+  local out verdict=GO
+  out=$(checks)
+  grep -q '^WARN' <<< "$out" && verdict=WARN
+  grep -q '^NOGO' <<< "$out" && verdict=NOGO
+  if [ "${1:-}" = --json ]; then
+    OUT=$out V=$verdict python3 -c 'import json, os
+print(json.dumps({"verdict": os.environ["V"], "checks": [dict(zip(("level", "text"), l.split(" ", 1))) for l in os.environ["OUT"].splitlines()]}))'
+  else
+    sed -e 's/^GO /  [ ok ] /' -e 's/^WARN /  [warn] /' -e 's/^NOGO /  [FAIL] /' <<< "$out"
+    case $verdict in GO) say "GO";; WARN) say "GO, with warnings";; NOGO) say "NO-GO";; esac
+  fi
+  [ "$verdict" != NOGO ]
+}
+
+# --------------------------------------------------------------------- ledger
+# What an install changed, in order; uninstall undoes it backwards.
+#   new PATH       created: removed       saved PATH   was there: restored from backup/
+#   pkg NAME       installed: removed     gone NAME    removed: reinstall it by hand
+#   ufw, firewalld the receiver's rule    omdrop-cli DIR  the omdrop CLI set up here
+#   # ...          the machine before
+
+led() { printf '%s\n' "$*" >> "$LEDGER"; }
+
+claim() {  # PATH: note it once, keeping what was there
+  grep -qxF -e "new $1" -e "saved $1" "$LEDGER" 2>/dev/null && return
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    mkdir -p "$(dirname "$BACKUP$1")" && cp -a "$1" "$BACKUP$1" && led "saved $1"
+  else
+    led "new $1"
+  fi
+}
+
+place() { claim "$3"; install -Dm "$1" "$2" "$3"; }  # MODE SRC DEST
+
+ledger_open() {  # DIR
+  LEDGER=$1/ledger BACKUP=$1/backup
+  mkdir -p "$BACKUP"
+  [ -s "$LEDGER" ] && return
+  {
+    echo "# installed $(date -Is) by $(id -un)"
+    echo "# before: $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}"), kernel $(uname -r)"
+    [ "$(id -u)" = 0 ] && {
+      echo "# before: Wi-Fi $(wifi_iface) ($(basename "$(readlink -f "/sys/class/net/$(wifi_iface)/device/driver")" 2>/dev/null))"
+      echo "# before: NetworkManager conf.d: $(ls /etc/NetworkManager/conf.d 2>/dev/null | tr '\n' ' ')"
+      echo "# before: ufw $(systemctl is-active ufw 2>/dev/null), firewalld $(systemctl is-active firewalld 2>/dev/null)"
+    }
+  } > "$LEDGER"
+}
+
+# Undo LEDGER's files under PREFIX, last first; its other lines go to REST.
+replay() {  # LEDGER BACKUP PREFIX
+  local line what arg
+  REST=()
+  mapfile -t lines < <(tac "$1")
+  for line in "${lines[@]}"; do
+    [[ "$line" == \#* ]] && continue
+    what=${line%% *} arg=${line#* }
+    case "$what" in
+      new|saved)
+        [[ "$arg" == "$3"/?* ]] || continue
+        rm -rf "${arg:?}"
+        [ "$what" = saved ] && cp -a "$2$arg" "$arg" && say "restored $arg" ;;
+      *) REST+=("$line") ;;
+    esac
+  done
+}
+
+pkg_present() {  # PM NAME
+  case "$1" in
+    apt-get) dpkg-query -W -f='${Status}' "$2" 2>/dev/null | grep -q 'ok installed' ;;
+    dnf|zypper) rpm -q "$2" >/dev/null 2>&1 ;;
+    pacman) pacman -Q "$2" >/dev/null 2>&1 ;;
+  esac
+}
+
+# Removes one package only if nothing else needs it.
+pkg_remove() {  # PM NAME
+  case "$1" in
+    apt-get) dpkg -r "$2" >/dev/null 2>&1 ;;
+    dnf|zypper) rpm -e "$2" >/dev/null 2>&1 ;;
+    pacman) pacman -R --noconfirm "$2" >/dev/null 2>&1 ;;
+  esac
+}
+
+# -------------------------------------------------------------------- install
+
+# Root: dependencies, OWL built in a scratch copy, files to fixed paths.
+cmd_system_install() {
+  local m src=${1:-$SRC} work f p before=()
+  [ "$(id -u)" = 0 ] || die "system-install runs as root"
+  ledger_open "$STATE"
+  m=$(pm)
+  if [ -n "$m" ]; then
+    say "Installing dependencies ($m)"
+    for p in $(deps "$m"); do pkg_present "$m" "$p" && before+=("$p"); done
+    # shellcheck disable=SC2046
+    pm_install "$m" $(deps "$m")
+    for p in $(deps "$m"); do
+      [[ " ${before[*]} " == *" $p "* ]] || ! pkg_present "$m" "$p" || grep -qx "pkg $p" "$LEDGER" || led "pkg $p"
+    done
+    pkg_present "$m" omdrop-owl && case "$m" in
+      apt-get) apt-get remove -y -qq omdrop-owl ;;
+      dnf|zypper) rpm -e omdrop-owl ;;
+      pacman) pacman -R --noconfirm omdrop-owl ;;
+    esac && led "gone omdrop-owl"
+  fi
+  work=$(mktemp -d) || die "no temporary directory"
+  trap 'rm -rf "${work:?}"' RETURN
+  say "Building OWL"
+  # A copied CMake cache names the old path, and CMake refuses it.
+  cp -a "$src/." "$work/" && rm -rf "${work:?}/build" "${work:?}/upstream/owl/build"
+  if ! { "$work/tools/build-owl.sh" && "$work/tools/stage.sh"; } > "$work/build.log" 2>&1; then
+    tail -15 "$work/build.log"
+    die "the build failed"
+  fi
+  say "Installing files"
+  # A removed package can leave only Python's cache behind: that isn't worth keeping.
+  rm -rf "${LIB:?}/__pycache__"
+  rmdir "$LIB" 2>/dev/null
+  claim "$LIB"
+  claim /etc/omdrop
+  mkdir -p /etc/omdrop
+  find "$work/build/lib" -maxdepth 1 -type f -exec install -D -m 755 -t "$LIB" {} +
+  chmod 644 "$LIB/owl-profiles"
+  install -m 755 "$work/tools/omdrop-installer" "$work/packaging/check-nm-unmanaged" "$LIB/"
+  place 644 "$work/packaging/omdrop-owl.policy" /usr/share/polkit-1/actions/io.github.t4t5.omdrop-owl.policy
+  place 644 "$work/packaging/99-omdrop-owl-unmanaged.conf" /usr/lib/NetworkManager/conf.d/99-omdrop-owl-unmanaged.conf
+  place 644 "$work/packaging/86-omdrop-owl-unmanaged.rules" /usr/lib/udev/rules.d/86-omdrop-owl-unmanaged.rules
+  place 644 "$work/packaging/10-omdrop-owl-awdl0.link" /usr/lib/systemd/network/10-omdrop-owl-awdl0.link
+  claim /usr/local/bin/omdrop-installer
+  ln -sfn "$LIB/omdrop-installer" /usr/local/bin/omdrop-installer
+  udevadm control --reload >/dev/null 2>&1
+  systemctl is-active --quiet NetworkManager && nmcli general reload conf >/dev/null 2>&1
+  if command -v ufw >/dev/null && systemctl is-active --quiet ufw && ! ufw status | grep -q '8771/tcp on awdl0'; then
+    ufw "${UFW_RULE[@]}" >/dev/null && led ufw
+  fi
+  if command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld \
+    && firewall-cmd -q --permanent --new-zone=omdrop 2>/dev/null; then
+    firewall-cmd -q --permanent --zone=omdrop --add-interface=awdl0 --add-port=8771/tcp && firewall-cmd -q --reload && led firewalld
+  fi
+  chmod -R go+rX "$STATE"
+  "$LIB/check-nm-unmanaged" || say "warning: NetworkManager still manages OmDrop's interfaces (see /etc/NetworkManager/conf.d/)"
+}
+
+# Root: the ledger, backwards.
+cmd_system_uninstall() {
+  local m line arg pkgs=() left=()
+  [ "$(id -u)" = 0 ] || die "system-uninstall runs as root"
+  [ -f "$STATE/ledger" ] || { say "No install ledger in $STATE: nothing to undo."; return 0; }
+  m=$(pm)
+  "$LIB/omdrop-discoverable" stop >/dev/null 2>&1
+  replay "$STATE/ledger" "$STATE/backup" ""
+  for line in "${REST[@]}"; do
+    arg=${line#* }
+    case "${line%% *}" in
+      pkg) pkgs+=("$arg") ;;
+      ufw) ufw --force delete "${UFW_RULE[@]}" >/dev/null 2>&1 ;;
+      firewalld) firewall-cmd -q --permanent --delete-zone=omdrop && firewall-cmd -q --reload ;;
+      gone) say "Install removed the $arg package; reinstall it if you want it back." ;;
+    esac
+  done
+  if [ ${#pkgs[@]} -gt 0 ] && [ -n "$m" ]; then
+    say "Removing ${#pkgs[@]} packages the install added (kept if something else needs them)"
+    for _ in 1 2; do
+      left=()
+      for p in "${pkgs[@]}"; do pkg_remove "$m" "$p" || left+=("$p"); done
+      pkgs=("${left[@]}")
+      [ ${#pkgs[@]} -gt 0 ] || break
+    done
+    [ ${#pkgs[@]} -eq 0 ] || say "Kept, still needed: ${pkgs[*]}"
+  fi
+  udevadm control --reload >/dev/null 2>&1
+  systemctl is-active --quiet NetworkManager && nmcli general reload conf >/dev/null 2>&1
+  rm -rf "${STATE:?}"
+}
+
+as_root() {
+  if [ "$(id -u)" = 0 ]; then "$@"
+  elif [ -n "${OMDROP_GUI:-}" ] && command -v pkexec >/dev/null; then pkexec "$(command -v "$1")" "${@:2}"
+  else sudo "$@"; fi
+}
+
+user_install() {
+  ledger_open "$USTATE"
+  if ! command -v omdrop >/dev/null; then
+    say "Setting up the omdrop CLI"
+    if [ -d "$PLUGIN_DIR/.git" ]; then git -C "$PLUGIN_DIR" pull -q --ff-only
+    else git clone -q --depth 1 "$PLUGIN_REPO" "$PLUGIN_DIR"; fi
+    "$PLUGIN_DIR/bin/omdrop" setup >/dev/null && led "omdrop-cli $PLUGIN_DIR"
+  fi
+  has_display && [ "$(tray_backend)" != none ] && install_tray
+  true
+}
+
+install_tray() {
+  local s d
+  [ -n "${LEDGER:-}" ] || ledger_open "$USTATE"
+  place 755 "$SRC/desktop/omdrop-tray" "$HOME/.local/bin/omdrop-tray"
+  for s in on off loading; do
+    place 644 "$SRC/desktop/icons/omdrop-$s.svg" "$DATA/omdrop-tray/icons/omdrop-$s.svg"
+    place 644 "$SRC/desktop/icons/omdrop-$s.svg" "$DATA/icons/hicolor/scalable/apps/omdrop-$s.svg"
+    place 644 "$SRC/desktop/icons/omdrop-$s-symbolic.svg" "$DATA/icons/hicolor/symbolic/apps/omdrop-$s-symbolic.svg"
+  done
+  d=$(mktemp)
+  sed "s|^Exec=.*|Exec=$HOME/.local/bin/omdrop-tray|" "$SRC/desktop/omdrop-tray.desktop" > "$d"
+  place 644 "$d" "$DATA/applications/omdrop-tray.desktop"
+  place 644 "$d" "$CONFIG/autostart/omdrop-tray.desktop"
+  rm -f "$d"
+  gtk-update-icon-cache -q -t "$DATA/icons/hicolor" 2>/dev/null || true
+}
+
+cmd_install() {
+  cmd_check >/dev/null || { cmd_check; die "this machine can't run OmDrop (see above)"; }
+  [ -f "$SRC/tools/build-owl.sh" ] || die "no source at $SRC"
+  as_root bash "$SRC/tools/omdrop-installer" system-install "$SRC" || die "the system install failed"
+  user_install
+}
+
+# --------------------------------------------------------------- detect, configure
+
+# Try shared (Wi-Fi stays up) and the best single-radio mode; score each.
+cmd_detect() {
+  local caps modes=() m r results=() best='' bestscore=-1 profile score secs=${OMDROP_TRIAL_SECS:-20}
+  DETECTED=
+  [ -x "$HELPER" ] || die "not installed yet: omdrop-installer install"
+  caps=$("$HELPER" caps)
+  profile=$(python3 -c 'import json, sys; c = json.loads(sys.argv[1]); print(c.get("profile", "") if c.get("tested") else "")' "$caps")
+  grep -q '"monitor": true' <<< "$caps" && modes+=(shared)
+  if grep -q '"ibss": true' <<< "$caps"; then modes+=(exclusive)
+  elif grep -q '"active_monitor": true' <<< "$caps"; then modes+=(active-monitor); fi
+  [ ${#modes[@]} -gt 0 ] || die "this card has no mode OmDrop can use"
+  omdrop off --force >/dev/null 2>&1
+  for m in "${modes[@]}"; do
+    say "Trying $m (${secs}s)..." >&2
+    r=$($ELEVATE "$HELPER" trial "$m" "$secs") || r="{\"mode\": \"$m\", \"started\": false, \"reason\": \"not authorised\"}"
+    score=$(python3 -c 'import json, sys
+t = json.loads(sys.argv[1]); s = 0
+if t.get("started") and t.get("awdl"):
+    s = 10 + 5 * min(t.get("peers", 0), 3) + (3 if t.get("gateway") else 0)
+    s += 2 if t["mode"] == sys.argv[2] else 0
+    s += 1 if t["mode"] == "shared" else 0
+print(s)' "$r" "$profile")
+    results+=("$r")
+    [ "$score" -gt "$bestscore" ] && { bestscore=$score; best=$m; }
+  done
+  [ "$bestscore" -gt 0 ] || best=''
+  DETECTED=$best
+  if [ "${1:-}" = --json ]; then
+    printf '{"recommended": "%s", "results": [%s]}\n' "$best" "$(IFS=,; echo "${results[*]}")"
+  else
+    for r in "${results[@]}"; do
+      python3 -c 'import json, sys
+t = json.loads(sys.argv[1])
+if not t.get("started"):
+    print("  %-15s didn'"'"'t start: %s" % (t["mode"], t.get("reason") or "?"))
+else:
+    print("  %-15s OmDrop %s, %d device(s) heard, gateway %s" % (t["mode"], "up" if t.get("awdl") else "down",
+          t.get("peers", 0), {True: "reachable", False: "unreachable", None: "none"}[t.get("gateway")]))' "$r"
+    done
+    [ -n "$best" ] && say "Recommended: $best" || say "Neither mode brought OmDrop up."
+  fi
+  [ -n "$best" ]
+}
+
+cmd_configure() {
+  [ -n "${1:-}" ] || die "usage: omdrop-installer configure shared|exclusive|active-monitor|reset"
+  $ELEVATE "$HELPER" configure "$1" && say "OmDrop will run in $1 mode."
+}
+
+# Yours first (as you), then the system's (one password), each backwards.
+cmd_uninstall() {
+  local line arg
+  omdrop off --force >/dev/null 2>&1
+  [ -n "${OMDROP_FROM_TRAY:-}" ] || gdbus call --session --dest io.github.kwilliam208.OmdropTray \
+    --object-path /io/github/kwilliam208/OmdropTray --method org.gtk.Actions.Activate quit "[]" "{}" >/dev/null 2>&1
+  if [ -f "$STATE/ledger" ]; then
+    as_root bash "$SELF" system-uninstall || die "the system part wasn't undone"
+  elif [ -f "$LIB/.manifest" ]; then
+    as_root sh -c 'rm -rf $(cat '"$LIB"'/.manifest) /etc/omdrop'
+  fi
+  if [ -f "$USTATE/ledger" ]; then
+    replay "$USTATE/ledger" "$USTATE/backup" "$HOME"
+    for line in "${REST[@]}"; do
+      arg=${line#* }
+      case "${line%% *}" in
+        omdrop-cli) [[ "$arg" == "$HOME"/?* ]] || continue
+          "$arg/bin/omdrop" links remove >/dev/null 2>&1
+          systemctl --user disable --now airdrop-receiver.service >/dev/null 2>&1
+          rm -rf "$CONFIG/systemd/user/airdrop-receiver.service"*
+          [ "$(readlink -f "$HOME/.local/bin/omdrop")" = "$arg/bin/omdrop" ] && rm -f "$HOME/.local/bin/omdrop"
+          rm -rf "${arg:?}"
+          systemctl --user daemon-reload ;;
+      esac
+    done
+  fi
+  # An install from before the ledger: its known files.
+  [ -f "$USTATE/ledger" ] || rm -rf "$HOME/.local/bin/omdrop-tray" "$DATA/omdrop-tray" \
+    "$DATA/applications/omdrop-tray.desktop" "$CONFIG/autostart/omdrop-tray.desktop" "$DATA"/icons/hicolor/*/apps/omdrop-*.svg
+  rm -rf "${USTATE:?}" "$HOME/.config/omdrop-owl" "${XDG_STATE_HOME:-$HOME/.local/state}/omdrop-tray"
+  gtk-update-icon-cache -q -t "$DATA/icons/hicolor" 2>/dev/null || true
+  say "Uninstalled; what was there before is back. Received files and omdrop's name and identity are kept."
+}
+
+# What the install changed, from both ledgers.
+cmd_ledger() {
+  local f
+  for f in "$STATE/ledger" "$USTATE/ledger"; do
+    [ -f "$f" ] || continue
+    say "$f:"
+    sed 's/^/  /' "$f"
+  done
+}
+
+# ------------------------------------------------------------------- terminal
+
+wizard() {
+  local best choice
+  step "1. Compatibility"
+  cmd_check || die "this machine can't run OmDrop"
+  step "2. Install"
+  if [ -x "$HELPER" ] && [ "$(tty_read 'Already installed. Reinstall? [y/N] ')" != y ]; then :; else cmd_install; fi
+  step "3. Detect hardware"
+  say "Wi-Fi may drop for a few seconds while each mode is tried."
+  tty_read 'Press Enter to start. ' >/dev/null
+  cmd_detect || true
+  best=${DETECTED:-$("$HELPER" caps 2>/dev/null | python3 -c 'import json, sys; print(json.load(sys.stdin).get("profile", "shared"))' 2>/dev/null)}
+  step "4. Choose"
+  choice=$(tty_read "Mode [${best:-shared}] (shared/exclusive/active-monitor): ")
+  cmd_configure "${choice:-${best:-shared}}"
+  [ "$(tty_read 'Legacy (Troubleshooting) data rate? [y/N] ')" = y ] && { mkdir -p "$HOME/.config/omdrop-owl"; touch "$HOME/.config/omdrop-owl/legacy-rate"; }
+  step "Done"
+  say "What changed:     omdrop-installer ledger"
+  say "Undo it all:      omdrop-installer uninstall"
+  say "Turn OmDrop on:   omdrop on 10m"
+  say "Send a file:      omdrop send NAME FILE"
+  say "Turn it off:      omdrop off"
+}
+
+case "${1:-}" in
+  '') wizard ;;
+  check) shift; cmd_check "$@" ;;
+  install) cmd_install ;;
+  system-install) shift; cmd_system_install "$@" ;;
+  detect) shift; cmd_detect "$@" ;;
+  configure) shift; cmd_configure "$@" ;;
+  uninstall) cmd_uninstall ;;
+  system-uninstall) cmd_system_uninstall ;;
+  ledger) cmd_ledger ;;
+  tray) install_tray ;;
+  *) sed -n '2,10p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

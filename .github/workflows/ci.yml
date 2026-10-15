@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y bats shellcheck network-manager python3-gi gir1.2-gtk-3.0 gir1.2-xapp-1.0
+      - name: shellcheck
+        run: |
+          shellcheck --severity=warning install.sh tools/omdrop-installer tools/build-owl.sh tools/stage.sh \
+            tools/run-tests.sh tools/rate-sweep.sh userspace/omdrop-discoverable packaging/check-nm-unmanaged tests/helpers.bash
+      - run: tools/run-tests.sh
+      - run: /usr/bin/python3 desktop/omdrop-tray --self-test
+
+  # The installer's root step on each package manager it knows.
+  install:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:24.04, debian:12, fedora:latest, archlinux:latest, opensuse/tumbleweed]
+    container: ${{ matrix.image }}
+    steps:
+      - name: bash and git
+        run: |
+          if command -v apt-get; then apt-get update -qq && apt-get install -y -qq bash git
+          elif command -v dnf; then dnf install -y -q bash git
+          elif command -v zypper; then zypper -n -q install bash git
+          else pacman -Sy --noconfirm --needed bash git; fi
+      - uses: actions/checkout@v4
+      - run: bash tools/omdrop-installer system-install "$PWD"
+      - run: test -x /usr/lib/omdrop/owl && test -x /usr/lib/omdrop/omdrop-discoverable && test -L /usr/local/bin/omdrop-installer
+      - run: /usr/lib/omdrop/omdrop-discoverable caps

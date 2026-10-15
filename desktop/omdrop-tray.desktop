@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=OmDrop Status
+GenericName=OmDrop
+Comment=Turn OmDrop (omdrop) on for a while and watch its activity from the panel
+Exec=omdrop-tray
+Icon=omdrop-on
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=OmDrop;omdrop;Apple;iPhone;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
